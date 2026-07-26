@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.serena/
+pretrained_models/
+FireRedVAD/

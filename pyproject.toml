@@ -1,0 +1,23 @@
+[project]
+name = "voiceassistant"
+version = "0.1.0"
+description = "Hindi-first Pipecat browser voice agent"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "pipecat-ai[google,runner,webrtc]>=1.4.0,<2",
+    "python-dotenv>=1,<2",
+]
+
+[project.optional-dependencies]
+cobra = ["pvcobra>=3,<4"]
+ten = ["pipecat-ten-vad"]
+firered = ["pipecat-firered-vad"]
+rnnoise = ["pipecat-ai[rnnoise]>=1.4.0,<2"]
+koala = ["pipecat-ai[koala]>=1.4.0,<2"]
+
+[dependency-groups]
+dev = ["pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
