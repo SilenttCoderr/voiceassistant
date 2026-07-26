@@ -1,7 +1,7 @@
 import builtins
 import asyncio
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -122,6 +122,79 @@ def test_firered_gpu_flag_is_validated_before_construction(monkeypatch):
     with pytest.raises(
         RuntimeError, match="FIREREDVAD_USE_GPU must be exactly 0 or 1"
     ):
+        vad.create_vad("firered")
+    assert constructed is False
+
+
+def test_firered_adapter_uses_upstream_frame_length_and_confidence(monkeypatch):
+    class FakeEngine:
+        def __init__(self):
+            self.frames = []
+            self.results = iter(
+                (
+                    SimpleNamespace(smoothed_prob=1.25, raw_prob=0.5),
+                    SimpleNamespace(raw_prob=-0.25),
+                )
+            )
+
+        def detect_frame(self, frame):
+            self.frames.append(frame)
+            return next(self.results)
+
+    class CommunityFireVadAnalyzer:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self._vad = FakeEngine()
+            self.reset_calls = 0
+
+        def num_frames_required(self):
+            return 160
+
+        def reset(self):
+            self.reset_calls += 1
+
+    community = ModuleType("pipecat_firered_vad")
+    community.FireVadAnalyzer = CommunityFireVadAnalyzer
+    constants = ModuleType("fireredvad.core.constants")
+    constants.FRAME_LENGTH_SAMPLE = 400
+    monkeypatch.setitem(sys.modules, "pipecat_firered_vad", community)
+    monkeypatch.setitem(sys.modules, "fireredvad", ModuleType("fireredvad"))
+    monkeypatch.setitem(sys.modules, "fireredvad.core", ModuleType("fireredvad.core"))
+    monkeypatch.setitem(sys.modules, "fireredvad.core.constants", constants)
+    monkeypatch.setenv("FIREREDVAD_MODEL_DIR", "model-dir")
+
+    analyzer = vad.create_vad("firered")
+    frame = bytes(400 * 2)
+
+    assert isinstance(analyzer, CommunityFireVadAnalyzer)
+    assert analyzer.kwargs["model_dir"] == "model-dir"
+    assert analyzer.kwargs["speech_threshold"] == 0.6
+    assert analyzer.num_frames_required() == 400
+    assert analyzer.voice_confidence(frame) == 1.0
+    assert analyzer.voice_confidence(frame) == 0.0
+    assert all(len(sent) == 400 and sent.dtype.name == "int16" for sent in analyzer._vad.frames)
+    analyzer.reset()
+    assert analyzer.reset_calls == 1
+
+
+@pytest.mark.parametrize("value", ["nan", "-0.1", "1.1"])
+def test_firered_speech_threshold_is_validated_before_construction(monkeypatch, value):
+    constructed = False
+
+    class FakeFireVadAnalyzer:
+        def __init__(self, **kwargs):
+            nonlocal constructed
+            constructed = True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pipecat_firered_vad",
+        SimpleNamespace(FireVadAnalyzer=FakeFireVadAnalyzer),
+    )
+    monkeypatch.setenv("FIREREDVAD_MODEL_DIR", "model-dir")
+    monkeypatch.setenv("FIREREDVAD_SPEECH_THRESHOLD", value)
+
+    with pytest.raises(RuntimeError, match="FIREREDVAD_SPEECH_THRESHOLD"):
         vad.create_vad("firered")
     assert constructed is False
 

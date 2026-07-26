@@ -115,6 +115,8 @@ Common configuration will cover the closest supported equivalents of:
 
 Backend-specific controls remain optional environment settings rather than being forced into a misleading universal abstraction.
 
+FireRed exposes `FIREREDVAD_SPEECH_THRESHOLD`, defaulting to `0.6` and validated within `0.0` to `1.0`. This model-level gate is separate from Pipecat's shared `VAD_CONFIDENCE`, `VAD_START_SECS`, `VAD_STOP_SECS`, and `VAD_MIN_VOLUME` controls. Silero uses those shared Pipecat controls and does not expose FireRed's internal smoothing or minimum-frame settings.
+
 ### Cobra Adapter
 
 Pipecat does not currently document a built-in Cobra analyzer. The project will therefore contain one minimal adapter implementing Pipecat's VAD analyzer contract around `pvcobra`.

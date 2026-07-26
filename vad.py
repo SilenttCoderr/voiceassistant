@@ -127,6 +127,9 @@ def create_vad(backend: str | None = None) -> VADAnalyzer | None:
         model_dir = os.getenv("FIREREDVAD_MODEL_DIR")
         if not model_dir:
             raise RuntimeError("FIREREDVAD_MODEL_DIR is required when VAD_BACKEND=firered")
+        speech_threshold = _float_env(
+            "FIREREDVAD_SPEECH_THRESHOLD", 0.6, minimum=0, maximum=1
+        )
         use_gpu_value = os.getenv("FIREREDVAD_USE_GPU", "0")
         if use_gpu_value not in ("0", "1"):
             raise RuntimeError("FIREREDVAD_USE_GPU must be exactly 0 or 1")
@@ -138,10 +141,29 @@ def create_vad(backend: str | None = None) -> VADAnalyzer | None:
             raise RuntimeError(
                 "FireRed selected; install it with 'uv sync --extra firered'"
             ) from exc
-        return FireVadAnalyzer(
+        from fireredvad.core.constants import FRAME_LENGTH_SAMPLE
+
+        class CompatibleFireVadAnalyzer(FireVadAnalyzer):
+            def num_frames_required(self) -> int:
+                return FRAME_LENGTH_SAMPLE
+
+            def voice_confidence(self, buffer: bytes) -> float:
+                import numpy as np
+
+                frame = np.frombuffer(buffer, dtype="<i2")
+                if len(frame) != FRAME_LENGTH_SAMPLE:
+                    return 0.0
+                result = self._vad.detect_frame(frame)
+                probability = getattr(
+                    result, "smoothed_prob", getattr(result, "raw_prob", 0.0)
+                )
+                return float(np.clip(probability, 0.0, 1.0))
+
+        return CompatibleFireVadAnalyzer(
             model_dir=model_dir,
             sample_rate=16000,
             params=params,
+            speech_threshold=speech_threshold,
             use_gpu=use_gpu_value == "1",
         )
 

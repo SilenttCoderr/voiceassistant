@@ -65,7 +65,7 @@ uv sync --extra firered
 uvx --from "huggingface_hub[cli]" huggingface-cli download FireRedTeam/FireRedVAD --local-dir pretrained_models/FireRedVAD
 ```
 
-Set `VAD_BACKEND=firered` and `FIREREDVAD_MODEL_DIR=pretrained_models/FireRedVAD/Stream-VAD`. Set `FIREREDVAD_USE_GPU=1` only when a working CUDA environment exists.
+Set `VAD_BACKEND=firered` and `FIREREDVAD_MODEL_DIR=pretrained_models/FireRedVAD/Stream-VAD`. `FIREREDVAD_SPEECH_THRESHOLD` defaults to `0.6`; lower values accept softer speech and higher values reject more noise. Set `FIREREDVAD_USE_GPU=1` only when a working CUDA environment exists.
 
 ### Picovoice Cobra
 
@@ -82,6 +82,9 @@ Set `VAD_BACKEND=cobra` and `PICOVOICE_ACCESS_KEY`. The local adapter converts 1
 - `VAD_STOP_SECS`: silence required before speech end, default `0.3`.
 - `VAD_MIN_VOLUME`: minimum normalized volume, default `0.6`.
 - `TEN_VAD_THRESHOLD`: native TEN speech gate, default `0.6`; `VAD_CONFIDENCE` remains Pipecat's second gate.
+- `FIREREDVAD_SPEECH_THRESHOLD`: FireRed's model-level speech gate, default `0.6`.
+
+Silero uses the shared Pipecat controls (`VAD_CONFIDENCE`, `VAD_START_SECS`, `VAD_STOP_SECS`, and `VAD_MIN_VOLUME`). It does not expose FireRed's internal smoothing-window or minimum-frame settings.
 
 Change one setting at a time. Backend-specific controls remain separate because they are not equivalent across models.
 
