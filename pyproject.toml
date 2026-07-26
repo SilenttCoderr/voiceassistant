@@ -10,8 +10,8 @@ dependencies = [
 
 [project.optional-dependencies]
 cobra = ["pvcobra>=3,<4"]
-ten = ["pipecat-ten-vad"]
-firered = ["pipecat-firered-vad"]
+ten = ["ten-vad @ git+https://github.com/TEN-framework/ten-vad.git@22a3bcd4509d0faaa8eef4881e8af5f39c178950"]
+firered = ["fireredvad[cpu]==0.0.2", "pipecat-firered-vad==0.1.0"]
 rnnoise = ["pipecat-ai[rnnoise]>=1.4.0,<2"]
 koala = ["pipecat-ai[koala]>=1.4.0,<2"]
 
