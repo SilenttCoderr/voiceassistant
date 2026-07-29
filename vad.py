@@ -30,10 +30,10 @@ def _float_env(
 
 def common_vad_params() -> VADParams:
     return VADParams(
-        confidence=_float_env("VAD_CONFIDENCE", 0.7, minimum=0, maximum=1),
+        confidence=_float_env("VAD_CONFIDENCE", 0.5, minimum=0, maximum=1),
         start_secs=_float_env("VAD_START_SECS", 0.2, minimum=0),
-        stop_secs=_float_env("VAD_STOP_SECS", 0.3, minimum=0),
-        min_volume=_float_env("VAD_MIN_VOLUME", 0.6, minimum=0, maximum=1),
+        stop_secs=_float_env("VAD_STOP_SECS", 0.45, minimum=0),
+        min_volume=_float_env("VAD_MIN_VOLUME", 0.35, minimum=0, maximum=1),
     )
 
 
@@ -154,9 +154,7 @@ def create_vad(backend: str | None = None) -> VADAnalyzer | None:
                 if len(frame) != FRAME_LENGTH_SAMPLE:
                     return 0.0
                 result = self._vad.detect_frame(frame)
-                probability = getattr(
-                    result, "smoothed_prob", getattr(result, "raw_prob", 0.0)
-                )
+                probability = getattr(result, "raw_prob", 0.0)
                 return float(np.clip(probability, 0.0, 1.0))
 
         return CompatibleFireVadAnalyzer(

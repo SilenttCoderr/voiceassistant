@@ -6,3 +6,6 @@ __pycache__/
 .serena/
 pretrained_models/
 FireRedVAD/
+.claude/
+.tokensave/
+.remember/

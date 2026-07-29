@@ -65,3 +65,47 @@ rtk git diff --check
 ```
 
 Expected: all tests pass and checks exit successfully.
+
+### Task 2: Make FireRed Authoritative and Apply the Balanced Preset
+
+**Files:**
+- Modify: `tests/test_vad.py`
+- Modify: `vad.py`
+- Modify: `.env.example`
+- Modify: `README.md`
+
+**Interfaces:**
+- FireRed returns binary confidence from `StreamVadFrameResult.is_speech`.
+- Pipecat retains `VAD_START_SECS`, `VAD_STOP_SECS`, and `VAD_MIN_VOLUME` turn controls.
+
+- [ ] **Step 1: Write failing tests**
+
+Add tests proving FireRed returns `1.0` when `is_speech` is true and `0.0` when false, regardless of raw probability. Add a configuration test for the balanced defaults.
+
+- [ ] **Step 2: Run focused tests and verify RED**
+
+Run: `rtk uv run pytest tests/test_vad.py -k "firered_adapter or balanced" -v`
+
+Expected: the adapter test fails because it still returns `smoothed_prob`.
+
+- [ ] **Step 3: Implement the threshold gate**
+
+Return `1.0 if result.is_speech else 0.0` from the compatible FireRed adapter. Keep the dynamic upstream frame length and exact PCM16 conversion.
+
+- [ ] **Step 4: Apply and document balanced defaults**
+
+Set these example defaults:
+
+```dotenv
+VAD_CONFIDENCE=0.5
+VAD_START_SECS=0.20
+VAD_STOP_SECS=0.45
+VAD_MIN_VOLUME=0.35
+FIREREDVAD_SPEECH_THRESHOLD=0.6
+```
+
+Document that FireRed's internal smoothing remains `5`, while Pipecat owns turn timing.
+
+- [ ] **Step 5: Verify GREEN**
+
+Run the focused VAD tests, complete test suite, compile check, real FireRed model smoke, and `git diff --check`.

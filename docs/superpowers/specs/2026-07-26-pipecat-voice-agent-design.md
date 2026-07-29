@@ -115,7 +115,9 @@ Common configuration will cover the closest supported equivalents of:
 
 Backend-specific controls remain optional environment settings rather than being forced into a misleading universal abstraction.
 
-FireRed exposes `FIREREDVAD_SPEECH_THRESHOLD`, defaulting to `0.6` and validated within `0.0` to `1.0`. This model-level gate is separate from Pipecat's shared `VAD_CONFIDENCE`, `VAD_START_SECS`, `VAD_STOP_SECS`, and `VAD_MIN_VOLUME` controls. Silero uses those shared Pipecat controls and does not expose FireRed's internal smoothing or minimum-frame settings.
+FireRed exposes `FIREREDVAD_MODE`, validated as blank or an integer from `0` to `3`. Mode `3` is the default and applies FireRed's very-aggressive preset (approximately `speech_threshold=0.9`, `smooth_window_size=5`, `min_speech_frame=20`, and `min_silence_frame=5`). When mode is blank, FireRed uses the validated custom `FIREREDVAD_SPEECH_THRESHOLD`, defaulting to `0.6`.
+
+The adapter converts FireRed's thresholded `is_speech` decision to binary confidence (`1.0` for speech, `0.0` for non-speech). Pipecat owns turn timing through `VAD_START_SECS=0.20` and `VAD_STOP_SECS=0.45`, with `VAD_MIN_VOLUME=0.35`; `VAD_CONFIDENCE=0.5` remains a binary-confidence acceptance gate. FireRed's internal segment counters do not define Pipecat turn boundaries in this integration. Silero continues to use the shared Pipecat probability and timing controls directly.
 
 ### Cobra Adapter
 

@@ -4,6 +4,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from dotenv import dotenv_values
 
 import vad
 
@@ -132,8 +133,8 @@ def test_firered_adapter_uses_upstream_frame_length_and_confidence(monkeypatch):
             self.frames = []
             self.results = iter(
                 (
-                    SimpleNamespace(smoothed_prob=1.25, raw_prob=0.5),
-                    SimpleNamespace(raw_prob=-0.25),
+                    SimpleNamespace(is_speech=False, smoothed_prob=0.95, raw_prob=0.95),
+                    SimpleNamespace(is_speech=True, smoothed_prob=0.10, raw_prob=0.10),
                 )
             )
 
@@ -162,6 +163,7 @@ def test_firered_adapter_uses_upstream_frame_length_and_confidence(monkeypatch):
     monkeypatch.setitem(sys.modules, "fireredvad.core", ModuleType("fireredvad.core"))
     monkeypatch.setitem(sys.modules, "fireredvad.core.constants", constants)
     monkeypatch.setenv("FIREREDVAD_MODEL_DIR", "model-dir")
+    monkeypatch.delenv("FIREREDVAD_SPEECH_THRESHOLD", raising=False)
 
     analyzer = vad.create_vad("firered")
     frame = bytes(400 * 2)
@@ -170,8 +172,10 @@ def test_firered_adapter_uses_upstream_frame_length_and_confidence(monkeypatch):
     assert analyzer.kwargs["model_dir"] == "model-dir"
     assert analyzer.kwargs["speech_threshold"] == 0.6
     assert analyzer.num_frames_required() == 400
-    assert analyzer.voice_confidence(frame) == 1.0
-    assert analyzer.voice_confidence(frame) == 0.0
+    # The fakes disagree with is_speech on purpose: confidence must follow the model's
+    # probability, not its thresholded decision.
+    assert analyzer.voice_confidence(frame) == pytest.approx(0.95)
+    assert analyzer.voice_confidence(frame) == pytest.approx(0.10)
     assert all(len(sent) == 400 and sent.dtype.name == "int16" for sent in analyzer._vad.frames)
     analyzer.reset()
     assert analyzer.reset_calls == 1
@@ -197,6 +201,16 @@ def test_firered_speech_threshold_is_validated_before_construction(monkeypatch, 
     with pytest.raises(RuntimeError, match="FIREREDVAD_SPEECH_THRESHOLD"):
         vad.create_vad("firered")
     assert constructed is False
+
+
+def test_env_example_uses_balanced_firered_defaults():
+    values = dotenv_values(".env.example")
+
+    assert values["FIREREDVAD_SPEECH_THRESHOLD"] == "0.6"
+    assert values["VAD_CONFIDENCE"] == "0.5"
+    assert values["VAD_START_SECS"] == "0.20"
+    assert values["VAD_STOP_SECS"] == "0.45"
+    assert values["VAD_MIN_VOLUME"] == "0.35"
 
 
 @pytest.mark.parametrize(

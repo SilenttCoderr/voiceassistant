@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VAD Lab</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 20px; background: #12141a; color: #e6e8ee;
+         font: 13px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; }
+  h1 { font-size: 15px; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 4px; }
+  .hint { color: #8b93a7; margin: 0 0 16px; max-width: 900px; }
+  .row { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }
+  fieldset { border: 1px solid #2a2f3d; border-radius: 6px; padding: 10px 14px 14px; margin: 0 0 12px; }
+  legend { color: #8b93a7; padding: 0 6px; letter-spacing: .06em; }
+  label { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  label span:first-child { width: 150px; color: #b6bccd; }
+  select, button, input[type=number] { background: #1c2029; color: #e6e8ee;
+      border: 1px solid #333a4a; border-radius: 4px; padding: 5px 8px; font: inherit; }
+  input[type=number] { width: 68px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #7fd1b9; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.rec { border-color: #e0716f; color: #e0716f; }
+  button.primary { border-color: #7fd1b9; color: #7fd1b9; }
+
+  #slots { display: flex; flex-direction: column; gap: 10px; width: 330px; }
+  .slot { border: 1px solid #2a2f3d; border-left: 4px solid var(--tint); border-radius: 6px;
+          padding: 8px 10px; background: #161922; }
+  .slot-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .slot-head .name { flex: 1; color: var(--tint); }
+  .slot-head button { padding: 2px 7px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 8px; }
+  .grid label { margin: 2px 0; }
+  .grid label span:first-child { width: auto; flex: 1; font-size: 11px; color: #8b93a7; }
+
+  .stack { position: relative; }
+  canvas { display: block; width: 100%; background: #0c0e13;
+           border: 1px solid #2a2f3d; border-radius: 6px; }
+  #overlay { position: absolute; inset: 0; background: none; border-color: transparent;
+             pointer-events: none; }
+  #view { cursor: crosshair; }
+  #status { margin: 10px 0; min-height: 20px; }
+  .err { color: #e0716f; } .ok { color: #7fd1b9; }
+  table { border-collapse: collapse; margin-top: 10px; width: 100%; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid #22262f; }
+  th { color: #8b93a7; font-weight: normal; }
+  td.bad { color: #e0716f; }
+</style>
+</head>
+<body>
+
+<h1>VAD Lab</h1>
+<p class="hint">
+  Record the environment that breaks the agent, then replay that one clip through as many
+  slots as you like. Each slot is a backend plus its own settings, so the same model can be
+  run several times at different thresholds. Click or drag the spectrogram to hear exactly
+  what a backend was reacting to.
+</p>
+
+<div class="row">
+  <div style="width:330px">
+    <fieldset>
+      <legend>audio</legend>
+      <label><span>&nbsp;</span>
+        <button id="record" class="rec">● record</button>
+        <button id="stop" disabled>■ stop</button>
+      </label>
+      <label><span>browser cleanup</span>
+        <input type="checkbox" id="browser_ns">
+        <span style="width:auto;font-size:11px;color:#8b93a7">AEC + NS + AGC while recording</span></label>
+      <label><span>load a clip</span><input type="file" id="file" accept="audio/*"></label>
+      <label><span>clip</span><span id="clip">none loaded</span></label>
+      <audio id="player" controls style="width:100%"></audio>
+    </fieldset>
+
+    <div id="slots"></div>
+    <div style="margin:10px 0; display:flex; gap:8px">
+      <button id="add">+ add slot</button>
+      <button id="analyze" class="primary" disabled>analyze</button>
+    </div>
+  </div>
+
+  <div style="flex:1; min-width:560px">
+    <div class="stack">
+      <canvas id="view" width="1150" height="320"></canvas>
+      <canvas id="overlay" width="1150" height="320"></canvas>
+    </div>
+    <div id="status"></div>
+    <fieldset style="margin-top:10px">
+      <legend>what the model actually hears</legend>
+      <audio id="rendered" controls style="width:100%"></audio>
+      <div id="rendered_label" style="color:#8b93a7;font-size:11px">
+        pick a slot below: <b>filtered</b> is the clip after that slot's denoise chain,
+        <b>gated</b> is only the frames its VAD called speech.
+      </div>
+    </fieldset>
+    <table id="summary"></table>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const BACKENDS = ["silero", "ten", "firered", "cobra"];
+const NOISE_FILTERS = ["none", "highpass", "rnnoise", "highpass+rnnoise", "deepfilternet", "koala"];
+const TINTS = ["#7fd1b9","#6fa8e0","#e08a6f","#b58fd6","#c9a227","#8fd66f","#d66f9f","#6fd6d0"];
+const STATE_COLORS = { QUIET:"#232833", STARTING:"#c9a227", SPEAKING:"#3fa66b", STOPPING:"#b06a3b" };
+
+const PAD = 54, MEL_TOP = 8, MEL_H = 96, WAVE_H = 44, ROW_H = 92, CONF_H = 50, BAND_H = 20;
+const FIELDS = [
+  ["confidence", 0.05], ["start_secs", 0.05], ["stop_secs", 0.05], ["min_volume", 0.05],
+  ["ten_threshold", 0.05], ["firered_threshold", 0.05],
+  ["smart_turn_stop_secs", 0.1], ["smart_turn_max_duration_secs", 0.5],
+];
+
+let wavBase64 = null, slots = [], nextId = 1, payload = null, melCanvas = null;
+
+/* ---------- slots ---------- */
+function newSlot(from) {
+  return {
+    id: nextId++,
+    backend: from ? from.backend : "silero",
+    confidence: from ? from.confidence : 0.5,
+    start_secs: from ? from.start_secs : 0.2,
+    stop_secs: from ? from.stop_secs : 0.45,
+    min_volume: from ? from.min_volume : 0.35,
+    ten_threshold: from ? from.ten_threshold : 0.6,
+    firered_threshold: from ? from.firered_threshold : 0.6,
+    noise_filter: from ? from.noise_filter : "none",
+    noise_mix: from ? from.noise_mix : 1.0,
+    highpass_hz: from ? from.highpass_hz : 100,
+    rnnoise_quality: from ? from.rnnoise_quality : "HQ",
+    smart_turn: from ? from.smart_turn : true,
+    smart_turn_stop_secs: from ? from.smart_turn_stop_secs : 3.0,
+    smart_turn_max_duration_secs: from ? from.smart_turn_max_duration_secs : 8.0,
+  };
+}
+
+const tintOf = (slot) => TINTS[slots.indexOf(slot) % TINTS.length];
+
+function renderSlots() {
+  $("slots").innerHTML = slots.map((slot) => {
+    const threshold = slot.backend === "ten" ? "ten_threshold"
+                    : slot.backend === "firered" ? "firered_threshold" : null;
+    const num = (key, step) =>
+      `<label><span>${key.replace("smart_turn_", "st_").replace("_secs", "")}</span>
+       <input type="number" step="${step}" value="${slot[key]}" data-id="${slot.id}" data-key="${key}"></label>`;
+    return `
+     <div class="slot" style="--tint:${tintOf(slot)}">
+       <div class="slot-head">
+         <select data-id="${slot.id}" data-key="backend">
+           ${BACKENDS.map((b) => `<option${b === slot.backend ? " selected" : ""}>${b}</option>`).join("")}
+         </select>
+         <span class="name">slot ${slot.id}</span>
+         <button data-id="${slot.id}" data-act="dup" title="duplicate">&#10697;</button>
+         <button data-id="${slot.id}" data-act="del" title="remove">&#10005;</button>
+       </div>
+       <div class="grid">
+         ${num("confidence", 0.05)}${num("min_volume", 0.05)}
+         ${num("start_secs", 0.05)}${num("stop_secs", 0.05)}
+         ${threshold ? num(threshold, 0.05) : ""}
+       </div>
+       <label style="margin-top:6px"><span style="width:auto;flex:1;font-size:11px">denoise</span>
+         <select data-id="${slot.id}" data-key="noise_filter">
+           ${NOISE_FILTERS.map((f) => `<option${f === slot.noise_filter ? " selected" : ""}>${f}</option>`).join("")}
+         </select></label>
+       ${slot.noise_filter === "none" ? "" : `<div class="grid">
+         ${num("noise_mix", 0.05)}${num("highpass_hz", 10)}
+         <label><span>rnn_q</span>
+           <select data-id="${slot.id}" data-key="rnnoise_quality">
+             ${["QQ","LQ","MQ","HQ","VHQ"].map((q) => `<option${q === slot.rnnoise_quality ? " selected" : ""}>${q}</option>`).join("")}
+           </select></label>
+       </div>`}
+       <label style="margin-top:6px"><span style="width:auto;flex:1;font-size:11px">smart turn</span>
+         <input type="checkbox" data-id="${slot.id}" data-key="smart_turn"${slot.smart_turn ? " checked" : ""}></label>
+       ${slot.smart_turn ? `<div class="grid">${num("smart_turn_stop_secs", 0.1)}${num("smart_turn_max_duration_secs", 0.5)}</div>` : ""}
+     </div>`;
+  }).join("");
+}
+
+$("slots").addEventListener("input", (e) => {
+  const slot = slots.find((s) => s.id === Number(e.target.dataset.id));
+  if (!slot || !e.target.dataset.key) return;
+  const key = e.target.dataset.key;
+  slot[key] = e.target.type === "checkbox" ? e.target.checked
+            : e.target.tagName === "SELECT" ? e.target.value
+            : Number(e.target.value);
+  if (key === "backend" || key === "smart_turn" || key === "noise_filter") renderSlots();
+});
+
+$("slots").addEventListener("click", (e) => {
+  const act = e.target.dataset.act;
+  if (!act) return;
+  const index = slots.findIndex((s) => s.id === Number(e.target.dataset.id));
+  if (act === "dup") slots.splice(index + 1, 0, newSlot(slots[index]));
+  if (act === "del" && slots.length > 1) slots.splice(index, 1);
+  renderSlots();
+});
+
+$("add").onclick = () => { slots.push(newSlot(slots[slots.length - 1])); renderSlots(); };
+
+slots.push(newSlot());
+slots.push(newSlot({ ...slots[0], backend: "ten" }));
+renderSlots();
+
+function setStatus(text, cls = "") { $("status").className = cls; $("status").textContent = text; }
+
+/* ---------- recording ---------- */
+let ctx, source, processor, chunks, stream;
+
+$("record").onclick = async () => {
+  try {
+    const clean = $("browser_ns").checked;
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: clean, noiseSuppression: clean, autoGainControl: clean }
+    });
+  } catch (err) { return setStatus("mic denied: " + err.message, "err"); }
+  ctx = new AudioContext({ sampleRate: 16000 });
+  source = ctx.createMediaStreamSource(stream);
+  processor = ctx.createScriptProcessor(4096, 1, 1);
+  chunks = [];
+  processor.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  source.connect(processor); processor.connect(ctx.destination);
+  $("record").disabled = true; $("stop").disabled = false;
+  setStatus($("browser_ns").checked
+    ? "recording with browser AEC/NS/AGC on — this is what the agent hears today"
+    : "recording raw — browser cleanup is off, so this is the untouched room");
+};
+
+$("stop").onclick = async () => {
+  processor.disconnect(); source.disconnect();
+  stream.getTracks().forEach((t) => t.stop());
+  const rate = ctx.sampleRate; await ctx.close();
+  $("record").disabled = false; $("stop").disabled = true;
+  let total = 0; for (const c of chunks) total += c.length;
+  const merged = new Float32Array(total);
+  let at = 0; for (const c of chunks) { merged.set(c, at); at += c.length; }
+  loadWav(encodeWav(merged, rate), total / rate);
+};
+
+function encodeWav(samples, rate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2), view = new DataView(buffer);
+  const ascii = (at, text) => { for (let i = 0; i < text.length; i++) view.setUint8(at + i, text.charCodeAt(i)); };
+  ascii(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); ascii(8, "WAVEfmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  ascii(36, "data"); view.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function loadWav(blob, seconds) {
+  $("player").src = URL.createObjectURL(blob);
+  $("clip").textContent = seconds ? seconds.toFixed(1) + " s" : "loaded";
+  const reader = new FileReader();
+  reader.onload = () => {
+    wavBase64 = reader.result.split(",")[1];
+    $("analyze").disabled = false;
+    setStatus("clip ready — hit analyze", "ok");
+  };
+  reader.readAsDataURL(blob);
+}
+
+// Anything the browser can play is fair game — .m4a from Windows Sound Recorder, .mp3,
+// .ogg, .wav. The browser decodes it, resamples to 16 kHz and downmixes to mono, so the
+// server only ever sees a plain 16 kHz mono WAV.
+$("file").onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  setStatus("decoding " + file.name + "…");
+  let decoder;
+  try {
+    decoder = new AudioContext({ sampleRate: 16000 });
+    const audio = await decoder.decodeAudioData(await file.arrayBuffer());
+    const mono = new Float32Array(audio.length);
+    for (let channel = 0; channel < audio.numberOfChannels; channel++) {
+      const samples = audio.getChannelData(channel);
+      for (let i = 0; i < audio.length; i++) mono[i] += samples[i] / audio.numberOfChannels;
+    }
+    loadWav(encodeWav(mono, audio.sampleRate), audio.length / audio.sampleRate);
+  } catch (err) {
+    setStatus(`could not decode ${file.name}: ${err.message || err}`, "err");
+  } finally {
+    if (decoder) await decoder.close();
+  }
+};
+
+/* ---------- analysis ---------- */
+$("analyze").onclick = async () => {
+  setStatus("analyzing " + slots.length + " slot(s)…");
+  $("analyze").disabled = true;
+  try {
+    const response = await fetch("/analyze", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ wav: wavBase64, configs: slots })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "analysis failed");
+    payload = data;
+    melCanvas = buildMel(data.mel);
+    draw(); summarise();
+    const failed = data.results.filter((r) => r.error).length;
+    setStatus(failed ? failed + " slot(s) failed — see table" : "done — click or drag the spectrogram to listen",
+              failed ? "err" : "ok");
+  } catch (err) { setStatus(String(err.message || err), "err"); }
+  $("analyze").disabled = false;
+};
+
+/* ---------- spectrogram ---------- */
+function buildMel(mel) {
+  const bytes = atob(mel.data), canvas = document.createElement("canvas");
+  canvas.width = mel.frames; canvas.height = mel.mels;
+  const g = canvas.getContext("2d"), image = g.createImageData(mel.frames, mel.mels);
+  for (let f = 0; f < mel.frames; f++) {
+    for (let m = 0; m < mel.mels; m++) {
+      const v = bytes.charCodeAt(f * mel.mels + m) / 255;
+      const at = ((mel.mels - 1 - m) * mel.frames + f) * 4;
+      image.data[at] = 255 * Math.min(1, 1.6 * v);
+      image.data[at + 1] = 255 * Math.max(0, Math.min(1, 1.5 * v - 0.45));
+      image.data[at + 2] = 255 * Math.max(0, Math.min(1, 2.2 * v - 1.1)) + 40 * v;
+      image.data[at + 3] = 255;
+    }
+  }
+  g.putImageData(image, 0, 0);
+  return canvas;
+}
+
+/* ---------- drawing ---------- */
+const shown = () => (payload ? payload.results.filter((r) => !r.error) : []);
+const plotW = () => $("view").width - PAD - 14;
+const xOf = (t) => PAD + (t / payload.duration_secs) * plotW();
+const timeAt = (px) => Math.max(0, Math.min(payload.duration_secs,
+    ((px - PAD) / plotW()) * payload.duration_secs));
+
+function draw() {
+  const canvas = $("view"), g = canvas.getContext("2d"), list = shown();
+  const height = MEL_TOP + MEL_H + 10 + WAVE_H + 14 + list.length * ROW_H + 26;
+  canvas.height = height; $("overlay").height = height;
+  $("overlay").width = canvas.width;
+  g.fillStyle = "#0c0e13"; g.fillRect(0, 0, canvas.width, height);
+  if (!payload) return;
+
+  // mel spectrogram
+  g.fillStyle = "#8b93a7"; g.font = "11px monospace";
+  g.fillText("mel", 4, MEL_TOP + 10);
+  g.fillText("8k", 4, MEL_TOP + 22); g.fillText("0", 4, MEL_TOP + MEL_H);
+  if (melCanvas) {
+    g.imageSmoothingEnabled = true;
+    g.drawImage(melCanvas, PAD, MEL_TOP, plotW(), MEL_H);
+  }
+
+  // waveform
+  const waveTop = MEL_TOP + MEL_H + 10;
+  g.fillStyle = "#8b93a7"; g.fillText("wave", 4, waveTop + 10);
+  const first = list[0];
+  if (first) {
+    const data = first.result, n = data.state.length, step = data.frame_ms / 1000;
+    g.strokeStyle = "#4c88c4"; g.beginPath();
+    for (let i = 0; i < n; i++) {
+      const h = data.peak[i] * (WAVE_H - 4);
+      g.moveTo(xOf(i * step), waveTop + WAVE_H - h); g.lineTo(xOf(i * step), waveTop + WAVE_H);
+    }
+    g.stroke();
+  }
+
+  let top = waveTop + WAVE_H + 14;
+  for (const run of list) { drawRow(g, run, top); top += ROW_H; }
+
+  g.fillStyle = "#8b93a7"; g.font = "10px monospace";
+  const secs = payload.duration_secs, step = Math.max(1, Math.round(secs / 10));
+  for (let t = 0; t <= secs; t += step) g.fillText(t + "s", xOf(t), height - 6);
+}
+
+function drawRow(g, run, top) {
+  const data = run.result, config = run.config, n = data.state.length;
+  const slot = slots.find((s) => s.id === config.id);
+  const tint = slot ? tintOf(slot) : "#7fd1b9";
+  const step = data.frame_ms / 1000;
+
+  g.fillStyle = tint; g.font = "11px monospace";
+  g.fillText(rowLabel(config), 4, top - 3);
+
+  const ty = top + CONF_H - config.confidence * CONF_H;
+  g.strokeStyle = "#5a6478"; g.setLineDash([4, 4]);
+  g.beginPath(); g.moveTo(PAD, ty); g.lineTo(PAD + plotW(), ty); g.stroke();
+  g.setLineDash([]);
+
+  g.strokeStyle = tint; g.lineWidth = 1; g.beginPath();
+  for (let i = 0; i < n; i++) {
+    const y = top + CONF_H - Math.max(0, Math.min(1, data.confidence[i])) * CONF_H;
+    i ? g.lineTo(xOf(i * step), y) : g.moveTo(xOf(i * step), y);
+  }
+  g.stroke();
+
+  const bandTop = top + CONF_H + 6;
+  for (let i = 0; i < n; i++) {
+    g.fillStyle = STATE_COLORS[data.state[i]] || "#232833";
+    g.fillRect(xOf(i * step), bandTop, Math.max(plotW() / n, 1) + 0.5, BAND_H);
+  }
+
+  for (const mark of data.turns) {
+    const px = xOf(mark.frame * step);
+    g.strokeStyle = mark.complete ? "#e6e8ee" : "#6b7280";
+    g.setLineDash([3, 3]); g.beginPath();
+    g.moveTo(px, top); g.lineTo(px, bandTop + BAND_H); g.stroke(); g.setLineDash([]);
+    g.fillStyle = mark.complete ? "#e6e8ee" : "#6b7280"; g.font = "10px monospace";
+    g.fillText(mark.probability == null ? "—" : mark.probability.toFixed(2), px + 2, top + 9);
+  }
+}
+
+function rowLabel(c) {
+  const extra = c.backend === "ten" ? " thr=" + c.ten_threshold
+              : c.backend === "firered" ? " thr=" + c.firered_threshold : "";
+  const denoise = c.noise_filter && c.noise_filter !== "none" ? " +" + c.noise_filter : "";
+  return `slot ${c.id} · ${c.backend}${denoise}  conf=${c.confidence} start=${c.start_secs} `
+       + `stop=${c.stop_secs} vol=${c.min_volume}${extra}`;
+}
+
+/* ---------- click / drag to listen ---------- */
+const player = $("player");
+let dragFrom = null, stopAt = null;
+
+$("view").addEventListener("mousedown", (e) => {
+  if (!payload) return;
+  const rect = $("view").getBoundingClientRect();
+  dragFrom = timeAt((e.clientX - rect.left) * ($("view").width / rect.width));
+});
+
+$("view").addEventListener("mouseup", (e) => {
+  if (!payload || dragFrom === null) return;
+  const rect = $("view").getBoundingClientRect();
+  const to = timeAt((e.clientX - rect.left) * ($("view").width / rect.width));
+  const [from, until] = [Math.min(dragFrom, to), Math.max(dragFrom, to)];
+  dragFrom = null;
+  stopAt = until - from > 0.05 ? until : null;
+  player.currentTime = from;
+  player.play();
+  setStatus(stopAt ? `playing ${from.toFixed(2)}s → ${until.toFixed(2)}s`
+                   : `playing from ${from.toFixed(2)}s`, "ok");
+});
+
+player.addEventListener("timeupdate", () => {
+  if (stopAt !== null && player.currentTime >= stopAt) { player.pause(); stopAt = null; }
+});
+
+function tick() {
+  const g = $("overlay").getContext("2d");
+  g.clearRect(0, 0, $("overlay").width, $("overlay").height);
+  if (payload && player.duration) {
+    const px = xOf(Math.min(player.currentTime, payload.duration_secs));
+    g.strokeStyle = "#ffffff"; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(px, 0); g.lineTo(px, $("overlay").height - 18); g.stroke();
+  }
+  requestAnimationFrame(tick);
+}
+tick();
+
+/* ---------- summary ---------- */
+function summarise() {
+  const head = ["slot", "backend", "denoise", "settings", "speech %", "segments",
+                "turn ends", "mean conf", "listen"];
+  const body = [];
+  for (const run of payload.results) {
+    const c = run.config;
+    const listen = `<button data-render="${c.id}" data-mode="filtered">filtered</button> `
+                 + `<button data-render="${c.id}" data-mode="gated">gated</button>`;
+    if (run.error) {
+      body.push([c.id, c.backend, c.noise_filter || "none", "—", "—", "—", "—", run.error, ""]);
+      continue;
+    }
+    const s = run.result.state, speaking = s.filter((v) => v === "SPEAKING").length;
+    let segments = 0;
+    for (let i = 0; i < s.length; i++) if (s[i] === "SPEAKING" && s[i - 1] !== "SPEAKING") segments++;
+    const conf = run.result.confidence;
+    body.push([c.id, c.backend, c.noise_filter || "none",
+               `conf=${c.confidence} stop=${c.stop_secs} vol=${c.min_volume}`,
+               (100 * speaking / s.length).toFixed(1) + "%", segments,
+               run.result.turns.length,
+               (conf.reduce((a, b) => a + b, 0) / (conf.length || 1)).toFixed(3),
+               listen]);
+  }
+  $("summary").innerHTML =
+    "<tr>" + head.map((h) => `<th>${h}</th>`).join("") + "</tr>" +
+    body.map((r) => "<tr>" + r.map((c) =>
+      `<td${String(c).includes("Error") ? ' class="bad"' : ""}>${c}</td>`).join("") + "</tr>").join("");
+}
+
+/* ---------- render: hear exactly what a slot produces ---------- */
+$("summary").addEventListener("click", async (e) => {
+  const id = e.target.dataset.render;
+  if (!id) return;
+  const mode = e.target.dataset.mode;
+  const config = slots.find((s) => s.id === Number(id));
+  setStatus(`rendering slot ${id} (${mode})…`);
+  try {
+    const response = await fetch("/render", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ wav: wavBase64, config, mode })
+    });
+    if (!response.ok) throw new Error((await response.json()).error || "render failed");
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    $("rendered").src = url;
+    $("rendered").play();
+    $("rendered_label").innerHTML =
+      `slot ${id} · ${config.backend} · denoise=${config.noise_filter} · <b>${mode}</b> — `
+      + `<a href="${url}" download="slot${id}-${mode}.wav" style="color:#7fd1b9">download .wav</a>`;
+    setStatus(`playing slot ${id} (${mode}) — compare it against the original above`, "ok");
+  } catch (err) { setStatus(String(err.message || err), "err"); }
+});
+</script>
+</body>
+</html>
