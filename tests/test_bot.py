@@ -141,7 +141,7 @@ def test_browser_noise_filter_is_the_default(monkeypatch):
 def test_invalid_noise_filter_is_rejected():
     with pytest.raises(
         ValueError,
-        match="NOISE_FILTER must be one of: browser, rnnoise, koala",
+        match="NOISE_FILTER must be one of: browser, highpass, rnnoise, koala",
     ):
         bot.create_audio_filter("unknown")
 
@@ -161,7 +161,7 @@ def test_koala_requires_an_access_key(monkeypatch):
             "pyrnnoise",
             "pipecat.audio.filters.rnnoise_filter",
             "RNNoiseFilter",
-            {},
+            {"resampler_quality": "HQ"},
         ),
         (
             "koala",
@@ -361,3 +361,167 @@ def test_vad_mode_switches_gemini_server_vad():
     server_vad, user_params = bot.vad_configuration(analyzer)
     assert server_vad.disabled is True
     assert user_params.vad_analyzer is analyzer
+
+
+class BaseAudioFilterStub:
+    """Minimal stand-in for a Pipecat audio filter."""
+
+    async def start(self, sample_rate):
+        return None
+
+    async def stop(self):
+        return None
+
+    async def process_frame(self, frame):
+        return None
+
+    async def filter(self, audio):
+        return audio
+
+
+def test_noise_mix_wraps_the_whole_chain_once(monkeypatch):
+    pytest.importorskip("pyrnnoise")
+    monkeypatch.setenv("NOISE_MIX", "0.8")
+
+    mixed = bot.create_audio_filter("highpass+rnnoise")
+
+    assert type(mixed).__name__ == "MixedAudioFilter"
+    assert mixed._wet == 0.8
+    # Wrapped once, around the chain, not once per stage.
+    assert type(mixed._inner).__name__ == "ChainedAudioFilter"
+    assert all(type(f).__name__ != "MixedAudioFilter" for f in mixed._inner._filters)
+
+
+def test_noise_mix_of_one_adds_no_wrapper(monkeypatch):
+    monkeypatch.setenv("NOISE_MIX", "1.0")
+
+    assert type(bot.create_audio_filter("highpass")).__name__ == "HighPassFilter"
+
+
+def test_noise_mix_is_validated(monkeypatch):
+    monkeypatch.setenv("NOISE_MIX", "1.5")
+
+    with pytest.raises(RuntimeError, match="NOISE_MIX must be between 0 and 1"):
+        bot.create_audio_filter("highpass")
+
+
+def test_rnnoise_quality_is_validated(monkeypatch):
+    pytest.importorskip("pyrnnoise")
+    monkeypatch.setenv("RNNOISE_QUALITY", "SUPERB")
+
+    with pytest.raises(RuntimeError, match="RNNOISE_QUALITY must be one of"):
+        bot.create_audio_filter("rnnoise")
+
+
+def test_rnnoise_defaults_above_pipecats_lowest_quality(monkeypatch):
+    pytest.importorskip("pyrnnoise")
+    monkeypatch.delenv("RNNOISE_QUALITY", raising=False)
+
+    assert bot.create_audio_filter("rnnoise")._resampler_quality == "HQ"
+
+
+def test_mixed_filter_blends_towards_the_original():
+    import asyncio
+
+    import numpy as np
+
+    from noise import MixedAudioFilter
+
+    class Silencer(BaseAudioFilterStub):
+        async def filter(self, audio):
+            return b"\x00\x00" * (len(audio) // 2)
+
+    original = (np.full(320, 1000, dtype="<i2")).tobytes()
+
+    async def run(wet):
+        mixed = MixedAudioFilter(Silencer(), wet=wet)
+        await mixed.start(16000)
+        out = await mixed.filter(original)
+        await mixed.stop()
+        return np.frombuffer(out, "<i2")[0]
+
+    # Inner filter outputs silence, so the result is purely the dry share.
+    assert asyncio.run(run(1.0)) == 0
+    assert asyncio.run(run(0.75)) == pytest.approx(250, abs=2)
+    assert asyncio.run(run(0.0)) == pytest.approx(1000, abs=2)
+
+
+def test_noise_filters_can_be_chained():
+    pytest.importorskip("pyrnnoise")
+
+    chained = bot.create_audio_filter("highpass+rnnoise")
+
+    assert type(chained).__name__ == "ChainedAudioFilter"
+    assert [type(f).__name__ for f in chained._filters] == ["HighPassFilter", "RNNoiseFilter"]
+
+
+def test_browser_drops_out_of_a_chain():
+    single = bot.create_audio_filter("browser+highpass")
+
+    assert type(single).__name__ == "HighPassFilter"
+    assert bot.create_audio_filter("browser+browser") is None
+
+
+def test_chained_filter_runs_every_stage():
+    import asyncio
+
+    import numpy as np
+
+    chained = bot.create_audio_filter("highpass+highpass")
+
+    async def run():
+        await chained.start(16000)
+        t = np.arange(16000) / 16000
+        signal = 0.35 * np.sin(2 * np.pi * 200 * t) + 0.25 * np.sin(2 * np.pi * 45 * t)
+        pcm = (np.clip(signal, -1, 1) * 32767).astype("<i2").tobytes()
+        out = b"".join([await chained.filter(pcm[i : i + 640]) for i in range(0, len(pcm), 640)])
+        await chained.stop()
+        return pcm, out
+
+    pcm, out = asyncio.run(run())
+
+    def low_band(raw):
+        samples = np.frombuffer(raw, "<i2").astype(float)
+        spectrum = np.abs(np.fft.rfft(samples))
+        freqs = np.fft.rfftfreq(samples.size, 1 / 16000)
+        return spectrum[(freqs >= 20) & (freqs < 100)].mean()
+
+    # Two high-passes in series attenuate more than one would.
+    assert low_band(out) < low_band(pcm) * 0.2
+    assert len(out) == len(pcm)
+
+
+def test_turn_detection_defaults_to_smart_turn(monkeypatch):
+    monkeypatch.delenv("TURN_DETECTION", raising=False)
+
+    strategies = bot.create_turn_strategies()
+
+    assert [type(s).__name__ for s in strategies.stop] == ["TurnAnalyzerUserTurnStopStrategy"]
+
+
+def test_plain_vad_turn_detection_skips_the_turn_model():
+    strategies = bot.create_turn_strategies("vad")
+
+    assert [type(s).__name__ for s in strategies.stop] == ["SpeechTimeoutUserTurnStopStrategy"]
+
+
+def test_invalid_turn_detection_is_rejected():
+    with pytest.raises(ValueError, match="TURN_DETECTION must be one of: smart, vad"):
+        bot.create_turn_strategies("unknown")
+
+
+def test_smart_turn_params_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv("SMART_TURN_STOP_SECS", "1.5")
+    monkeypatch.setenv("SMART_TURN_MAX_DURATION_SECS", "12")
+
+    analyzer = bot.create_turn_strategies("smart").stop[0]._turn_analyzer
+
+    assert analyzer._params.stop_secs == 1.5
+    assert analyzer._params.max_duration_secs == 12
+
+
+def test_smart_turn_settings_are_validated_before_construction(monkeypatch):
+    monkeypatch.setenv("SMART_TURN_STOP_SECS", "-1")
+
+    with pytest.raises(RuntimeError, match="SMART_TURN_STOP_SECS must be at least 0"):
+        bot.create_turn_strategies("smart")

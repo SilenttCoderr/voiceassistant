@@ -17,7 +17,8 @@ if __name__ == "__main__":
 from dotenv import load_dotenv
 
 from pipecat.audio.filters.base_audio_filter import BaseAudioFilter
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import LLMRunFrame, MetricsFrame
+from pipecat.metrics.metrics import TurnMetricsData
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -36,9 +37,10 @@ from pipecat.services.google.gemini_live.llm import (
     GeminiVADParams,
 )
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from vad import create_vad
+from vad import _float_env, create_vad
 
 load_dotenv(override=False)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -79,6 +81,33 @@ def get_gemini_voice() -> str:
 
 def create_audio_filter(name: str | None = None) -> BaseAudioFilter | None:
     selected = (name or os.getenv("NOISE_FILTER", "browser")).strip().lower()
+    built = _build_audio_filter(selected)
+    if built is None:
+        return None
+
+    # Blending a little of the original back in hides the artifacts aggressive denoising
+    # leaves behind. Applied once, around the whole chain.
+    wet = _float_env("NOISE_MIX", 1.0, minimum=0, maximum=1)
+    if wet >= 1.0:
+        return built
+    from noise import MixedAudioFilter
+
+    return MixedAudioFilter(built, wet=wet)
+
+
+def _build_audio_filter(selected: str) -> BaseAudioFilter | None:
+    if "+" in selected:
+        # "highpass+rnnoise" runs the stages in order. "browser" contributes no server-side
+        # filter, so it drops out of the chain.
+        stages = [_build_audio_filter(part.strip()) for part in selected.split("+")]
+        stages = [stage for stage in stages if stage is not None]
+        if not stages:
+            return None
+        if len(stages) == 1:
+            return stages[0]
+        from noise import ChainedAudioFilter
+
+        return ChainedAudioFilter(stages)
     if selected == "browser":
         return None
     if selected == "rnnoise":
@@ -91,7 +120,16 @@ def create_audio_filter(name: str | None = None) -> BaseAudioFilter | None:
             raise RuntimeError(
                 "RNNoise selected; install it with 'uv sync --extra rnnoise'"
             ) from exc
-        return RNNoiseFilter()
+        # Pipecat defaults to "QQ", the lowest soxr quality, and RNNoise round-trips
+        # 16k -> 48k -> 16k. That double resample is audible; "HQ" costs little.
+        quality = os.getenv("RNNOISE_QUALITY", "HQ").strip().upper()
+        if quality not in ("QQ", "LQ", "MQ", "HQ", "VHQ"):
+            raise RuntimeError("RNNOISE_QUALITY must be one of: QQ, LQ, MQ, HQ, VHQ")
+        return RNNoiseFilter(resampler_quality=quality)
+    if selected == "highpass":
+        from noise import HighPassFilter
+
+        return HighPassFilter(cutoff_hz=_float_env("HIGHPASS_HZ", 100.0, minimum=1))
     if selected == "koala":
         access_key = os.getenv("KOALA_ACCESS_KEY")
         if not access_key:
@@ -106,7 +144,10 @@ def create_audio_filter(name: str | None = None) -> BaseAudioFilter | None:
                 "Koala selected; install it with 'uv sync --extra koala'"
             ) from exc
         return KoalaFilter(access_key=access_key)
-    raise ValueError("NOISE_FILTER must be one of: browser, rnnoise, koala")
+    raise ValueError(
+        "NOISE_FILTER must be one of: browser, highpass, rnnoise, koala "
+        "(or several joined with '+', such as highpass+rnnoise)"
+    )
 
 
 def webrtc_transport_params(audio_filter: BaseAudioFilter | None = None) -> TransportParams:
@@ -118,12 +159,38 @@ def webrtc_transport_params(audio_filter: BaseAudioFilter | None = None) -> Tran
     )
 
 
+def create_turn_strategies(selected: str | None = None) -> UserTurnStrategies:
+    selected = (selected or os.getenv("TURN_DETECTION", "smart")).strip().lower()
+    if selected == "smart":
+        from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+        from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+        from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+
+        analyzer = LocalSmartTurnAnalyzerV3(
+            params=SmartTurnParams(
+                stop_secs=_float_env("SMART_TURN_STOP_SECS", 3.0, minimum=0),
+                max_duration_secs=_float_env("SMART_TURN_MAX_DURATION_SECS", 8.0, minimum=1),
+            )
+        )
+        return UserTurnStrategies(
+            stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=analyzer)]
+        )
+    if selected == "vad":
+        from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+
+        return UserTurnStrategies(stop=[SpeechTimeoutUserTurnStopStrategy()])
+    raise ValueError("TURN_DETECTION must be one of: smart, vad")
+
+
 def vad_configuration(analyzer):
     if analyzer is None:
         return GeminiVADParams(disabled=False), None
     return (
         GeminiVADParams(disabled=True),
-        LLMUserAggregatorParams(vad_analyzer=analyzer),
+        LLMUserAggregatorParams(
+            vad_analyzer=analyzer,
+            user_turn_strategies=create_turn_strategies(),
+        ),
     )
 
 
@@ -142,6 +209,10 @@ async def run_agent(transport: BaseTransport, runner_args: RunnerArguments) -> N
         gemini_vad, user_params = vad_configuration(analyzer)
         enable_turn_tracking, observability_notice = observability_configuration(analyzer)
         logger.info("vad_backend=%s", os.getenv("VAD_BACKEND", "gemini").strip().lower())
+        if analyzer is not None:
+            logger.info(
+                "turn_detection=%s", os.getenv("TURN_DETECTION", "smart").strip().lower()
+            )
         logger.info(observability_notice)
         llm = GeminiLiveLLMService(
             api_key=api_key,
@@ -194,6 +265,19 @@ async def run_agent(transport: BaseTransport, runner_args: RunnerArguments) -> N
     @latency_observer.event_handler("on_latency_measured")
     async def on_latency_measured(observer, latency):
         logger.info("user_to_bot_latency_seconds=%.3f", latency)
+
+    worker.set_reached_downstream_filter((MetricsFrame,))
+
+    @worker.event_handler("on_frame_reached_downstream")
+    async def on_frame_reached_downstream(worker, frame):
+        for data in frame.data:
+            if isinstance(data, TurnMetricsData):
+                logger.info(
+                    "turn_prediction complete=%s probability=%.3f e2e_ms=%.1f",
+                    data.is_complete,
+                    data.probability,
+                    data.e2e_processing_time_ms,
+                )
 
     @user_aggregator.event_handler("on_user_turn_started")
     async def on_user_turn_started(aggregator, strategy):
