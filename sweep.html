@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sweep</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 20px; background: #12141a; color: #e6e8ee;
+         font: 13px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; }
+  h1 { font-size: 15px; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 4px; }
+  h1 a { color: #8b93a7; font-size: 11px; letter-spacing: 0; text-transform: none; margin-left: 10px; }
+  .hint { color: #8b93a7; margin: 0 0 16px; max-width: 900px; }
+  .row { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }
+  fieldset { border: 1px solid #2a2f3d; border-radius: 6px; padding: 10px 14px 14px; margin: 0 0 12px; }
+  legend { color: #8b93a7; padding: 0 6px; letter-spacing: .06em; }
+  label { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  label span:first-child { width: 92px; color: #b6bccd; flex: none; }
+  select, button, input { background: #1c2029; color: #e6e8ee;
+      border: 1px solid #333a4a; border-radius: 4px; padding: 5px 8px; font: inherit; }
+  input[type=text] { flex: 1; min-width: 0; }
+  /* a file input reports a wide natural size and would otherwise stretch the whole
+     column, pushing the clip rows out of view */
+  input[type=file] { flex: 1; min-width: 0; max-width: 100%; padding: 3px; }
+  fieldset, .row > div { min-width: 0; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #7fd1b9; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { border-color: #7fd1b9; color: #7fd1b9; }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px 10px; }
+  .chips label { margin: 2px 0; gap: 5px; }
+  .chips label span { width: auto; color: #b6bccd; }
+
+  #clips { display: flex; flex-direction: column; gap: 3px; max-height: 190px; overflow: auto; }
+  .clip { display: flex; gap: 8px; align-items: center; padding: 4px 7px; border-radius: 4px;
+          border: 1px solid transparent; cursor: pointer; }
+  .clip:hover { border-color: #333a4a; }
+  .clip.on { border-color: #7fd1b9; background: #161e1c; }
+  .clip .n { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .clip .t { font-size: 11px; color: #8b93a7; }
+  .clip .t.no { color: #c9a227; }
+
+  canvas { display: block; width: 100%; background: #0c0e13;
+           border: 1px solid #2a2f3d; border-radius: 6px; cursor: crosshair; }
+  #status { margin: 10px 0; min-height: 20px; }
+  #track { height: 6px; background: #1c2029; border: 1px solid #2a2f3d; border-radius: 3px; overflow: hidden; }
+  #bar { height: 100%; width: 0; background: #7fd1b9; transition: width .2s linear; }
+  .err { color: #e0716f; } .ok { color: #7fd1b9; } .dim { color: #8b93a7; }
+  table { border-collapse: collapse; margin-top: 10px; width: 100%; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid #22262f; white-space: nowrap; }
+  th { color: #8b93a7; font-weight: normal; cursor: pointer; }
+  th:hover { color: #7fd1b9; }
+  tr.best td { color: #7fd1b9; }
+  td.bad { color: #e0716f; }
+</style>
+</head>
+<body>
+
+<h1>Sweep <a href="/">← VAD lab</a></h1>
+<p class="hint">
+  Draw where the speech is, save, then score every combination of settings against it.
+  Drag on empty canvas to add a region, drag an edge to move it, click a region and press
+  Delete to remove it. Anything not inside a region counts as noise the agent must ignore
+  — a clip with no regions at all is a pure negative, which is what makes the false
+  trigger rate mean something.
+</p>
+
+<div class="row">
+  <div style="width:340px">
+    <fieldset>
+      <legend>clips</legend>
+      <div id="clips"></div>
+      <label style="margin-top:8px"><span>add</span><input type="file" id="file" accept="audio/*"></label>
+      <div style="display:flex; gap:8px; margin-top:6px">
+        <button id="save" class="primary" disabled>save labels</button>
+        <button id="clear" disabled>clear regions</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>what to sweep</legend>
+      <label><span>backend</span><span class="chips" id="backends"></span></label>
+      <label><span>denoise</span><span class="chips" id="filters"></span></label>
+      <label><span>confidence</span><input type="text" id="confidence" value="0.4, 0.6, 0.8"></label>
+      <label><span>min_volume</span><input type="text" id="min_volume" value="0.2, 0.35, 0.6"></label>
+      <label><span>start_secs</span><input type="text" id="start_secs" value="0.2"></label>
+      <label><span>stop_secs</span><input type="text" id="stop_secs" value="0.45"></label>
+      <label><span>ten_thr</span><input type="text" id="ten_threshold" value="0.6"></label>
+      <label><span>noise_mix</span><input type="text" id="noise_mix" value="1.0"></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>speaker gate</legend>
+      <label><span>enroll</span><input type="text" id="speaker_enroll" placeholder="clips/enroll (blank = off)"></label>
+      <label><span>threshold</span><input type="text" id="speaker_threshold" value="0.4, 0.5"></label>
+    </fieldset>
+
+    <div style="display:flex; gap:8px; align-items:center">
+      <button id="run" class="primary">run sweep</button>
+      <span id="count" class="dim"></span>
+    </div>
+  </div>
+
+  <div style="flex:1; min-width:560px">
+    <canvas id="view" width="1150" height="240"></canvas>
+    <audio id="player" controls style="width:100%; margin-top:8px"></audio>
+    <div id="running" style="display:none; margin-top:10px">
+      <div id="track"><div id="bar"></div></div>
+      <div id="progress" class="dim" style="margin-top:4px"></div>
+    </div>
+    <div id="status"></div>
+    <table id="results"></table>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const BACKENDS = ["silero", "ten", "firered", "cobra"];
+const FILTERS = ["none", "highpass", "rnnoise", "highpass+rnnoise"];
+const NUMERIC = ["confidence", "min_volume", "start_secs", "stop_secs", "ten_threshold", "noise_mix"];
+const METRICS = [
+  ["score", "score", (r) => r.score.toFixed(1)],
+  ["miss", "miss %", (r) => (r.miss * 100).toFixed(1)],
+  ["false_per_min", "fals/min", (r) => r.false_per_min.toFixed(2)],
+  ["false_secs", "fals s", (r) => r.false_secs.toFixed(1)],
+  ["onset_ms", "onset", (r) => r.onset_ms.toFixed(0)],
+  ["tail_ms", "tail", (r) => r.tail_ms.toFixed(0)],
+];
+const PAD = 40, WAVE_TOP = 26, WAVE_H = 150, RULER = 18, EDGE_PX = 6;
+
+let clip = null;        // { name, secs, peaks, wavBase64|null }
+let regions = [];       // [[start, end], ...] in seconds
+let selected = -1, drag = null, results = null, sortKey = "score";
+
+const setStatus = (text, cls = "") => { $("status").className = cls; $("status").textContent = text; };
+
+/* ---------- chips ---------- */
+function chips(host, names, checked) {
+  host.innerHTML = names.map((name) => `<label><input type="checkbox" value="${name}"${
+    checked.includes(name) ? " checked" : ""}><span>${name}</span></label>`).join("");
+  host.addEventListener("change", updateCount);
+}
+const picked = (host) => [...host.querySelectorAll("input:checked")].map((i) => i.value);
+
+chips($("backends"), BACKENDS, ["ten"]);
+chips($("filters"), FILTERS, ["none", "highpass+rnnoise"]);
+
+/* ---------- the grid ---------- */
+const numbers = (id) => $(id).value.split(",").map((p) => p.trim()).filter(Boolean).map(Number)
+                          .filter((n) => Number.isFinite(n));
+
+function buildGrid() {
+  const grid = {};
+  const backends = picked($("backends")), filters = picked($("filters"));
+  if (backends.length) grid.backend = backends;
+  if (filters.length) grid.noise_filter = filters;
+  for (const key of NUMERIC) {
+    const values = numbers(key);
+    if (values.length) grid[key] = values;
+  }
+  const enroll = $("speaker_enroll").value.trim();
+  if (enroll) {
+    grid.speaker_enroll = [enroll];
+    // null keeps an ungated row in the table, which is the only honest baseline
+    grid.speaker_threshold = [null, ...numbers("speaker_threshold")];
+  }
+  return grid;
+}
+
+function updateCount() {
+  const grid = buildGrid();
+  let total = 1;
+  for (const values of Object.values(grid)) total *= values.length;
+  $("count").textContent = Object.keys(grid).length ? `${total} configs` : "nothing selected";
+}
+document.addEventListener("input", updateCount);
+updateCount();
+
+/* ---------- clip list ---------- */
+async function refreshClips(open) {
+  const list = await (await fetch("/clips")).json();
+  $("clips").innerHTML = list.length ? "" : '<span class="dim">none yet — add one below</span>';
+  for (const item of list) {
+    const node = document.createElement("div");
+    node.className = "clip" + (clip && clip.name === item.name ? " on" : "");
+    const count = item.speech === null ? "unlabelled"
+                : item.speech.length === 1 ? "1 region" : item.speech.length + " regions";
+    node.innerHTML = `<span class="n">${item.name}</span>` +
+      `<span class="t${item.speech === null ? " no" : ""}">${count}</span>`;
+    node.onclick = () => openClip(item);
+    $("clips").append(node);
+  }
+  if (open) openClip(list.find((i) => i.name === open));
+}
+
+async function openClip(item) {
+  if (!item) return;
+  setStatus("loading " + item.name + "…");
+  try {
+    const bytes = await (await fetch("/clips/" + encodeURIComponent(item.file))).arrayBuffer();
+    await useAudio(item.name, bytes, null);
+    regions = (item.speech || []).map(([a, b]) => [a, b]);
+    selected = -1;
+    setStatus(item.speech === null ? "no labels yet — drag to draw the speech" : "loaded", "ok");
+  } catch (err) { setStatus(String(err.message || err), "err"); }
+  draw();
+  [...$("clips").children].forEach((n) => n.classList?.toggle("on",
+      n.querySelector?.(".n")?.textContent === item.name));
+}
+
+/* Decode in the browser: it handles m4a, mp3 and ogg, so the server only ever stores
+   plain 16 kHz mono WAV and never needs ffmpeg for anything the UI saves. */
+async function useAudio(name, bytes, encode) {
+  const decoder = new AudioContext({ sampleRate: 16000 });
+  try {
+    const audio = await decoder.decodeAudioData(bytes);
+    const mono = new Float32Array(audio.length);
+    for (let c = 0; c < audio.numberOfChannels; c++) {
+      const samples = audio.getChannelData(c);
+      for (let i = 0; i < audio.length; i++) mono[i] += samples[i] / audio.numberOfChannels;
+    }
+    const blob = encodeWav(mono, 16000);
+    $("player").src = URL.createObjectURL(blob);
+    clip = { name, secs: mono.length / 16000, peaks: envelope(mono), wavBase64: null };
+    if (encode) clip.wavBase64 = await asBase64(blob);
+    $("save").disabled = $("clear").disabled = false;
+  } finally { await decoder.close(); }
+}
+
+function envelope(samples, buckets = 1600) {
+  const peaks = new Float32Array(buckets), per = samples.length / buckets;
+  for (let b = 0; b < buckets; b++) {
+    let top = 0;
+    for (let i = Math.floor(b * per); i < Math.floor((b + 1) * per) && i < samples.length; i++) {
+      const v = Math.abs(samples[i]);
+      if (v > top) top = v;
+    }
+    peaks[b] = top;
+  }
+  return peaks;
+}
+
+const asBase64 = (blob) => new Promise((done) => {
+  const reader = new FileReader();
+  reader.onload = () => done(reader.result.split(",")[1]);
+  reader.readAsDataURL(blob);
+});
+
+function encodeWav(samples, rate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2), view = new DataView(buffer);
+  const ascii = (at, text) => { for (let i = 0; i < text.length; i++) view.setUint8(at + i, text.charCodeAt(i)); };
+  ascii(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); ascii(8, "WAVEfmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  ascii(36, "data"); view.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+$("file").onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  setStatus("decoding " + file.name + "…");
+  try {
+    await useAudio(file.name.replace(/\.[^.]+$/, ""), await file.arrayBuffer(), true);
+    regions = []; selected = -1;
+    setStatus("drag across the canvas to mark where the speech is", "ok");
+  } catch (err) { setStatus(`could not decode ${file.name}: ${err.message || err}`, "err"); }
+  draw();
+};
+
+/* ---------- drawing ---------- */
+const plotW = () => $("view").width - PAD - 14;
+const xOf = (t) => PAD + (t / clip.secs) * plotW();
+const timeAt = (px) => Math.max(0, Math.min(clip.secs, ((px - PAD) / plotW()) * clip.secs));
+
+function draw() {
+  const canvas = $("view"), g = canvas.getContext("2d");
+  g.fillStyle = "#0c0e13"; g.fillRect(0, 0, canvas.width, canvas.height);
+  g.font = "11px monospace";
+  if (!clip) {
+    g.fillStyle = "#8b93a7";
+    g.fillText("pick a clip, or add one", PAD, 40);
+    return;
+  }
+
+  // regions behind the waveform, so the audio stays readable
+  regions.forEach(([start, end], index) => {
+    g.fillStyle = index === selected ? "rgba(127,209,185,.26)" : "rgba(63,166,107,.18)";
+    g.fillRect(xOf(start), WAVE_TOP, xOf(end) - xOf(start), WAVE_H);
+    g.strokeStyle = index === selected ? "#7fd1b9" : "#3fa66b";
+    g.beginPath();
+    for (const t of [start, end]) { g.moveTo(xOf(t), WAVE_TOP); g.lineTo(xOf(t), WAVE_TOP + WAVE_H); }
+    g.stroke();
+  });
+
+  const middle = WAVE_TOP + WAVE_H / 2;
+  g.strokeStyle = "#4c88c4"; g.beginPath();
+  for (let b = 0; b < clip.peaks.length; b++) {
+    const x = PAD + (b / clip.peaks.length) * plotW(), h = clip.peaks[b] * (WAVE_H / 2 - 2);
+    g.moveTo(x, middle - h); g.lineTo(x, middle + h);
+  }
+  g.stroke();
+
+  // ruler
+  const base = WAVE_TOP + WAVE_H;
+  g.strokeStyle = "#2a2f3d"; g.beginPath();
+  g.moveTo(PAD, base); g.lineTo(PAD + plotW(), base); g.stroke();
+  g.fillStyle = "#8b93a7";
+  const step = clip.secs > 60 ? 10 : clip.secs > 20 ? 5 : 1;
+  for (let t = 0; t <= clip.secs; t += step) {
+    g.beginPath(); g.moveTo(xOf(t), base); g.lineTo(xOf(t), base + 4); g.stroke();
+    g.fillText(t + "s", xOf(t) - 6, base + RULER);
+  }
+  g.fillText("wave", 4, middle);
+
+  regions.forEach(([start, end], index) => {
+    g.fillStyle = index === selected ? "#7fd1b9" : "#8b93a7";
+    g.fillText(`${start.toFixed(2)}–${end.toFixed(2)}`, xOf(start) + 3, WAVE_TOP - 6);
+  });
+
+  const player = $("player");
+  if (player.duration) {
+    g.strokeStyle = "#e6e8ee"; g.beginPath();
+    g.moveTo(xOf(player.currentTime), WAVE_TOP); g.lineTo(xOf(player.currentTime), base);
+    g.stroke();
+  }
+}
+
+$("player").addEventListener("timeupdate", draw);
+
+/* ---------- editing ---------- */
+function hit(time) {
+  for (let i = 0; i < regions.length; i++) {
+    const [start, end] = regions[i], slack = (EDGE_PX / plotW()) * clip.secs;
+    if (Math.abs(time - start) < slack) return { index: i, edge: 0 };
+    if (Math.abs(time - end) < slack) return { index: i, edge: 1 };
+    if (time > start && time < end) return { index: i, edge: null };
+  }
+  return null;
+}
+
+$("view").addEventListener("mousedown", (e) => {
+  if (!clip) return;
+  const rect = $("view").getBoundingClientRect();
+  const time = timeAt((e.clientX - rect.left) * ($("view").width / rect.width));
+  const found = hit(time);
+  if (found) {
+    selected = found.index;
+    drag = { ...found, from: time, original: [...regions[found.index]] };
+  } else {
+    selected = regions.length;
+    regions.push([time, time]);
+    drag = { index: selected, edge: 1, from: time, original: [time, time] };
+  }
+  draw();
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!drag || !clip) return;
+  const rect = $("view").getBoundingClientRect();
+  const time = timeAt((e.clientX - rect.left) * ($("view").width / rect.width));
+  const [start, end] = drag.original;
+  if (drag.edge === 0) regions[drag.index] = [Math.min(time, end), end];
+  else if (drag.edge === 1) regions[drag.index] = [start, Math.max(time, start)];
+  else {
+    const shift = Math.max(-start, Math.min(clip.secs - end, time - drag.from));
+    regions[drag.index] = [start + shift, end + shift];
+  }
+  draw();
+});
+
+window.addEventListener("mouseup", (e) => {
+  if (!drag || !clip) return;
+  const [start, end] = regions[drag.index];
+  if (end - start < 0.02) {
+    // a click rather than a drag: seek instead of leaving a sliver behind
+    regions.splice(drag.index, 1);
+    selected = -1;
+    $("player").currentTime = start;
+  }
+  drag = null;
+  draw();
+});
+
+window.addEventListener("keydown", (e) => {
+  if ((e.key !== "Delete" && e.key !== "Backspace") || selected < 0) return;
+  if (e.target.tagName === "INPUT") return;
+  regions.splice(selected, 1);
+  selected = -1;
+  e.preventDefault();
+  draw();
+});
+
+$("clear").onclick = () => { regions = []; selected = -1; draw(); };
+
+$("save").onclick = async () => {
+  if (!clip) return;
+  regions.sort((a, b) => a[0] - b[0]);
+  setStatus("saving…");
+  try {
+    const response = await fetch("/clips", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: clip.name, wav: clip.wavBase64, speech: regions })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error);
+    clip.wavBase64 = null;  // saved once; later saves are labels only
+    setStatus(`saved ${data.regions} region(s) to ${data.name}.json`, "ok");
+    await refreshClips(clip.name);
+  } catch (err) { setStatus(String(err.message || err), "err"); }
+};
+
+/* ---------- sweep ---------- */
+const clock = (seconds) =>
+  Math.floor(seconds / 60) + ":" + String(Math.round(seconds % 60)).padStart(2, "0");
+
+function showProgress(step, started) {
+  const share = step.total ? step.done / step.total : 0;
+  const elapsed = (Date.now() - started) / 1000;
+  // Only guess at what is left once a few steps have landed, otherwise the first
+  // estimate is the denoise pass and reads as wildly pessimistic.
+  const left = step.done >= 3 ? ` · ~${clock((elapsed / step.done) * (step.total - step.done))} left` : "";
+  $("bar").style.width = (share * 100).toFixed(1) + "%";
+  $("progress").textContent =
+    `${step.done} / ${step.total} · ${clock(elapsed)} elapsed${left}` +
+    (step.clip ? ` · ${step.clip}` : "");
+}
+
+$("run").onclick = async () => {
+  const grid = buildGrid();
+  if (!Object.keys(grid).length) return setStatus("pick at least one setting to sweep", "err");
+  $("run").disabled = true;
+  $("running").style.display = "block";
+  $("bar").style.width = "0%";
+  $("progress").textContent = "starting…";
+  setStatus("sweeping…");
+  const started = Date.now();
+  try {
+    const response = await fetch("/sweep", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ grid })
+    });
+    // Newline-delimited JSON: progress lines while it works, then one result line.
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    let buffer = "", data = null;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const message = JSON.parse(line);
+        if (message.error) throw new Error(message.error);
+        if (message.result) data = message.result;
+        else showProgress(message, started);
+      }
+    }
+    if (!data) throw new Error("the sweep stopped before returning a result");
+
+    results = data;
+    showResults();
+    const failed = data.rows.filter((r) => r.error).length;
+    setStatus(`${data.rows.length} configs over ${data.clips.length} clip(s), ` +
+      `${data.seconds.toFixed(0)}s of audio, in ${clock((Date.now() - started) / 1000)}` +
+      (data.unlabelled.length ? ` — skipped unlabelled: ${data.unlabelled.join(", ")}` : "") +
+      (failed ? ` — ${failed} config(s) failed` : ""), failed ? "err" : "ok");
+  } catch (err) { setStatus(String(err.message || err), "err"); }
+  $("running").style.display = "none";
+  $("run").disabled = false;
+};
+
+function showResults() {
+  const rows = results.rows.filter((r) => !r.error);
+  const broken = results.rows.filter((r) => r.error);
+  // only the settings that actually differ, or every row shows the same column
+  const keys = [...new Set(results.rows.flatMap((r) => Object.keys(r.config)))]
+    .filter((k) => new Set(results.rows.map((r) => String(r.config[k]))).size > 1);
+
+  rows.sort((a, b) => a[sortKey] - b[sortKey]);
+  const head = METRICS.map(([key, title]) => `<th data-sort="${key}">${title}</th>`).join("") +
+               keys.map((k) => `<th>${k}</th>`).join("");
+  const body = rows.map((row, index) =>
+    `<tr class="${index === 0 ? "best" : ""}">` +
+    METRICS.map(([, , format]) => `<td>${format(row)}</td>`).join("") +
+    keys.map((k) => `<td>${row.config[k]}</td>`).join("") + "</tr>").join("");
+  const failures = broken.map((row) =>
+    `<tr><td class="bad" colspan="${METRICS.length + keys.length}">${row.config.backend}: ${row.error}</td></tr>`).join("");
+
+  $("results").innerHTML = `<tr>${head}</tr>${body}${failures}`;
+  $("results").querySelectorAll("th[data-sort]").forEach((th) => {
+    th.onclick = () => { sortKey = th.dataset.sort; showResults(); };
+  });
+}
+
+draw();
+refreshClips();
+</script>
+</body>
+</html>

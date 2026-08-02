@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import io
+import json
 import os
 import wave
 from pathlib import Path
@@ -269,3 +271,214 @@ def test_analyze_returns_aligned_traces():
     assert result["duration_secs"] == pytest.approx(1.0, abs=0.05)
     assert set(result["state"]) <= {"QUIET", "STARTING", "SPEAKING", "STOPPING"}
     assert all(isinstance(value, float) for value in result["confidence"])
+
+
+def test_steady_resamplers_ignores_a_gap_between_chunks():
+    """A pause mid-clip must not change the audio, or every score moves with it.
+
+    Pipecat clears the resampler history after `clear_after_secs` of wall clock, so
+    without the patch a GC pause or a model load between two chunks silently rewrites
+    the rest of the clip. Faking an old timestamp reproduces that pause exactly.
+    """
+    import numpy as np
+    from pipecat.audio.resamplers.soxr_stream_resampler import SOXRStreamAudioResampler
+
+    rng = np.random.default_rng(0)
+    audio = (rng.normal(0, 0.2, RATE).clip(-1, 1) * 32767).astype("<i2").tobytes()
+    chunks = [audio[at : at + 640] for at in range(0, len(audio), 640)]
+
+    def resample(stale: bool) -> bytes:
+        # QQ, because HQ rounds two different ways run to run and would mask the gap
+        resampler = SOXRStreamAudioResampler(quality="QQ")
+        out = []
+        for index, chunk in enumerate(chunks):
+            if stale and index == len(chunks) // 2:
+                resampler._last_resample_time = 0  # as if the machine stalled here
+            out.append(asyncio.run(resampler.resample(chunk, RATE, 48000)))
+        return b"".join(out)
+
+    assert resample(stale=True) != resample(stale=False)
+
+    with lab._steady_resamplers():
+        assert resample(stale=True) == resample(stale=False)
+
+
+def test_steady_resamplers_restores_pipecat_afterwards():
+    from pipecat.audio.resamplers.soxr_stream_resampler import SOXRStreamAudioResampler
+
+    original = SOXRStreamAudioResampler._maybe_clear_internal_state
+
+    with lab._steady_resamplers():
+        assert SOXRStreamAudioResampler._maybe_clear_internal_state is not original
+
+    assert SOXRStreamAudioResampler._maybe_clear_internal_state is original
+
+
+def test_decode_audio_reads_wav_without_ffmpeg(tmp_path, monkeypatch):
+    import subprocess
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("WAV must not need ffmpeg")
+
+    monkeypatch.setattr(subprocess, "run", refuse)
+    source = tmp_path / "clip.wav"
+    source.write_bytes(lab._wav_bytes(tone(0.2)))
+
+    assert lab.decode_audio(source) == tone(0.2)
+
+
+def test_decode_audio_sends_m4a_through_ffmpeg_as_16k_mono(tmp_path, monkeypatch):
+    import subprocess
+
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        # ffmpeg writes to the path it was handed as the last argument
+        with wave.open(command[-1], "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(RATE)
+            out.writeframes(tone(0.1))
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = tmp_path / "Recording (2).m4a"
+    source.write_bytes(b"not really aac")
+
+    assert lab.decode_audio(source) == tone(0.1)
+
+    command = seen["command"]
+    assert command[0] == "ffmpeg"
+    assert str(source) in command
+    # mono at the lab's own rate, so nothing has to be resampled a second time
+    assert command[command.index("-ac") + 1] == "1"
+    assert command[command.index("-ar") + 1] == str(RATE)
+
+
+def test_decode_audio_says_how_to_install_a_missing_ffmpeg(tmp_path, monkeypatch):
+    import subprocess
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory: 'ffmpeg'")
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    source = tmp_path / "clip.m4a"
+    source.write_bytes(b"whatever")
+
+    with pytest.raises(RuntimeError, match="needs ffmpeg"):
+        lab.decode_audio(source)
+
+
+def test_decode_audio_reports_what_ffmpeg_complained_about(tmp_path, monkeypatch):
+    import subprocess
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command, 1, b"", b"Invalid data found when processing input\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = tmp_path / "broken.m4a"
+    source.write_bytes(b"truncated")
+
+    with pytest.raises(RuntimeError, match="Invalid data found"):
+        lab.decode_audio(source)
+
+
+def test_safe_clip_file_strips_any_path_it_is_given():
+    """Directories are dropped rather than rejected, so nothing can leave `clips/`."""
+    for name in ("../../secrets.wav", "/etc/passwd.wav", "sub/dir/me.wav"):
+        cleaned = lab.safe_clip_file(name)
+        assert "/" not in cleaned and "\\" not in cleaned
+        assert not cleaned.startswith("..")
+
+
+def test_safe_clip_file_refuses_names_that_are_not_a_recording():
+    for name in ("", "   ", "../.env", ".hidden.wav"):
+        with pytest.raises(ValueError):
+            lab.safe_clip_file(name)
+
+
+def test_safe_clip_file_keeps_a_plain_recording():
+    assert lab.safe_clip_file("Recording (2).m4a") == "Recording (2).m4a"
+    assert lab.safe_clip_file("me-1.wav") == "me-1.wav"
+
+
+def test_safe_clip_file_rejects_a_non_audio_suffix():
+    with pytest.raises(ValueError, match="not one of"):
+        lab.safe_clip_file("notes.txt")
+
+
+def test_save_clip_writes_the_audio_and_the_labels_together(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "CLIPS_DIR", tmp_path)
+    wav = base64.b64encode(lab._wav_bytes(tone(0.5))).decode()
+
+    result = lab.save_clip({"name": "me-1", "wav": wav, "speech": [[0.1, 0.4]]})
+
+    assert result == {"name": "me-1", "regions": 1}
+    assert lab.decode_wav((tmp_path / "me-1.wav").read_bytes()) == tone(0.5)
+    assert json.loads((tmp_path / "me-1.json").read_text())["speech"] == [[0.1, 0.4]]
+
+
+def test_save_clip_can_update_labels_without_resending_the_audio(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "CLIPS_DIR", tmp_path)
+    (tmp_path / "me-1.wav").write_bytes(lab._wav_bytes(tone(0.2)))
+    before = (tmp_path / "me-1.wav").read_bytes()
+
+    lab.save_clip({"name": "me-1", "wav": None, "speech": [[0.0, 0.1]]})
+
+    assert (tmp_path / "me-1.wav").read_bytes() == before
+    assert json.loads((tmp_path / "me-1.json").read_text())["speech"] == [[0.0, 0.1]]
+
+
+def test_save_clip_accepts_a_clip_with_no_speech_at_all(tmp_path, monkeypatch):
+    """A pure-noise clip is the whole point of the false trigger metric."""
+    monkeypatch.setattr(lab, "CLIPS_DIR", tmp_path)
+    wav = base64.b64encode(lab._wav_bytes(tone(0.2))).decode()
+
+    lab.save_clip({"name": "train", "wav": wav, "speech": []})
+
+    assert json.loads((tmp_path / "train.json").read_text())["speech"] == []
+
+
+def test_save_clip_rejects_a_backwards_region(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "CLIPS_DIR", tmp_path)
+
+    with pytest.raises(ValueError, match="ends before it starts"):
+        lab.save_clip({"name": "me-1", "wav": None, "speech": [[0.4, 0.1]]})
+
+    assert not (tmp_path / "me-1.json").exists()
+
+
+def test_save_clip_cannot_be_talked_into_writing_outside_the_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "CLIPS_DIR", tmp_path)
+    wav = base64.b64encode(lab._wav_bytes(tone(0.1))).decode()
+
+    lab.save_clip({"name": "../../escaped", "wav": wav, "speech": []})
+
+    # the traversal is stripped, not honoured: both files stay in the clips folder
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["escaped.json", "escaped.wav"]
+    assert not (tmp_path.parent / "escaped.wav").exists()
+
+
+def test_list_clips_reports_labels_where_they_exist(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "CLIPS_DIR", tmp_path)
+    (tmp_path / "labelled.wav").write_bytes(lab._wav_bytes(tone(0.1)))
+    (tmp_path / "labelled.json").write_text(json.dumps({"speech": [[0.0, 0.1]]}))
+    (tmp_path / "bare.m4a").write_bytes(b"aac")
+
+    listed = {item["name"]: item for item in lab.list_clips()}
+
+    assert listed["labelled"]["speech"] == [[0.0, 0.1]]
+    assert listed["labelled"]["file"] == "labelled.wav"
+    assert listed["bare"]["speech"] is None
+    assert listed["bare"]["file"] == "bare.m4a"
+
+
+def test_run_sweep_request_says_what_is_missing_when_nothing_is_labelled(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "CLIPS_DIR", tmp_path)
+    (tmp_path / "bare.wav").write_bytes(lab._wav_bytes(tone(0.1)))
+
+    with pytest.raises(ValueError, match="no labelled clips"):
+        lab.run_sweep_request({"grid": {"backend": ["silero"]}})

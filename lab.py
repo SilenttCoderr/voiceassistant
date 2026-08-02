@@ -27,7 +27,11 @@ load_dotenv(override=False)
 
 SAMPLE_RATE = 16000
 FILTER_CHUNK_BYTES = 640  # 20 ms of 16 kHz int16 mono
+# What a clip may be recorded as. Anything but WAV goes through ffmpeg.
+AUDIO_SUFFIXES = (".wav", ".m4a", ".mp3", ".mp4", ".aac", ".ogg", ".opus", ".flac", ".webm")
 LAB_HTML = Path(__file__).with_name("lab.html")
+SWEEP_HTML = Path(__file__).with_name("sweep.html")
+CLIPS_DIR = Path(__file__).with_name("clips")
 
 
 @contextmanager
@@ -67,6 +71,53 @@ def decode_wav(raw: bytes) -> bytes:
         pcm = soxr.resample(samples, rate, SAMPLE_RATE).astype("<i2").tobytes()
 
     return pcm
+
+
+def decode_audio(path: str | Path) -> bytes:
+    """Return 16 kHz mono int16 PCM from any file ffmpeg can read.
+
+    WAV is decoded in process; everything else costs one ffmpeg call. Windows Voice
+    Recorder writes m4a, and nothing in this venv decodes AAC — `soundfile` covers
+    MP3, FLAC and OGG but not that.
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".wav":
+        return decode_wav(path.read_bytes())
+    return decode_wav(_ffmpeg_to_wav(path))
+
+
+def _ffmpeg_to_wav(path: Path) -> bytes:
+    """Transcode to 16 kHz mono WAV through a temp file.
+
+    A temp file rather than a pipe: piped WAV carries an unknown length in its header,
+    which stdlib `wave` reads as a frame count of nonsense.
+    """
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "decoded.wav"
+        try:
+            completed = subprocess.run(
+                # fmt: off
+                [
+                    "ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+                    "-i", str(path),
+                    "-ac", "1", "-ar", str(SAMPLE_RATE), str(target),
+                ],
+                # fmt: on
+                capture_output=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"{path.suffix} needs ffmpeg to decode, and it is not on PATH. "
+                "Install it with 'winget install Gyan.FFmpeg', or record WAV instead."
+            ) from exc
+
+        if completed.returncode != 0 or not target.exists():
+            tail = completed.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+            raise RuntimeError(f"ffmpeg could not decode {path.name}: " + " | ".join(tail))
+        return target.read_bytes()
 
 
 def _env_overrides(config: dict) -> dict[str, str]:
@@ -189,6 +240,30 @@ async def apply_noise_chain(pcm: bytes, config: dict) -> bytes:
         return await apply_noise_filter(pcm, config.get("noise_filter"))
 
 
+@contextmanager
+def _steady_resamplers():
+    """Stop Pipecat's stream resampler from clearing its history on wall-clock gaps.
+
+    `SOXRStreamAudioResampler` wipes its filter history whenever more than
+    `clear_after_secs` (0.2 by default) passes between two chunks. In a live call
+    that is right — stale history after a silence causes artefacts. Replaying a file
+    it is wrong and invisible: a GC pause or a model load between two chunks clears
+    the history mid-clip, so the same WAV denoises differently on every run and every
+    score moves with it. The class supports this via `clear_after_secs=None`, but
+    `RNNoiseFilter` builds its own resamplers and passes only the quality through.
+
+    Lab only. The live pipeline in `bot.py` keeps the timing-based clearing.
+    """
+    from pipecat.audio.resamplers.soxr_stream_resampler import SOXRStreamAudioResampler
+
+    original = SOXRStreamAudioResampler._maybe_clear_internal_state
+    SOXRStreamAudioResampler._maybe_clear_internal_state = lambda self: None
+    try:
+        yield
+    finally:
+        SOXRStreamAudioResampler._maybe_clear_internal_state = original
+
+
 async def _run_pipecat_chain(pcm: bytes, chain: str) -> bytes:
     from bot import create_audio_filter
 
@@ -196,6 +271,11 @@ async def _run_pipecat_chain(pcm: bytes, chain: str) -> bytes:
     if audio_filter is None:
         return pcm
 
+    with _steady_resamplers():
+        return await _drive_filter(audio_filter, pcm)
+
+
+async def _drive_filter(audio_filter, pcm: bytes) -> bytes:
     await audio_filter.start(SAMPLE_RATE)
     try:
         chunks = [
@@ -389,7 +469,96 @@ def _frame_peak(frame: bytes) -> float:
     return float(np.abs(samples).max() / 32768.0)
 
 
+def safe_clip_file(name: str) -> str:
+    """A clip file name that cannot escape `clips/`.
+
+    The body of a POST is untrusted even on a local tool: `../../.env` would otherwise
+    be a valid clip name.
+    """
+    cleaned = Path(str(name)).name.strip()
+    if not cleaned or cleaned.startswith("."):
+        raise ValueError(f"unusable clip name: {name!r}")
+    if Path(cleaned).suffix.lower() not in AUDIO_SUFFIXES:
+        raise ValueError(f"{cleaned} is not one of {', '.join(AUDIO_SUFFIXES)}")
+    return cleaned
+
+
+def list_clips() -> list[dict]:
+    """Every recording in `clips/`, with its labels if it has any."""
+    found: dict[str, dict] = {}
+    for suffix in AUDIO_SUFFIXES:
+        for recording in sorted(CLIPS_DIR.glob(f"*{suffix}")):
+            if recording.stem in found:
+                continue
+            labels = recording.with_suffix(".json")
+            speech = None
+            if labels.exists():
+                speech = json.loads(labels.read_text(encoding="utf-8"))["speech"]
+            found[recording.stem] = {
+                "name": recording.stem,
+                "file": recording.name,
+                "speech": speech,
+            }
+    return list(found.values())
+
+
+def save_clip(request: dict) -> dict:
+    """Write a clip and its labels together, so the pair can never drift apart.
+
+    The browser has already decoded and downmixed whatever was dropped in, so what
+    arrives is always 16 kHz mono WAV — an m4a from Voice Recorder included.
+    """
+    # Validated even when no audio is attached, so the labels file is bound by the same
+    # rule as the recording and the two always land side by side.
+    name = Path(safe_clip_file(Path(str(request["name"])).stem + ".wav")).stem
+    speech = [[float(start), float(end)] for start, end in request.get("speech", [])]
+    for start, end in speech:
+        if end <= start:
+            raise ValueError(f"region {start:g}-{end:g} ends before it starts")
+
+    CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+    if request.get("wav"):
+        # Decode first: a malformed upload must not leave a half-written clip behind.
+        pcm = decode_wav(base64.b64decode(request["wav"]))
+        (CLIPS_DIR / (name + ".wav")).write_bytes(_wav_bytes(pcm))
+
+    (CLIPS_DIR / (name + ".json")).write_text(
+        json.dumps({"speech": speech}, indent=2), encoding="utf-8"
+    )
+    return {"name": name, "regions": len(speech)}
+
+
+def run_sweep_request(request: dict, on_progress=None) -> dict:
+    """Run a sweep for the browser. Imported here because `sweep` imports this module."""
+    import sweep
+
+    clips, unlabelled = sweep.load_clips(CLIPS_DIR)
+    if not clips:
+        raise ValueError("no labelled clips yet — label one and save it first")
+
+    configs = sweep.expand_grid(request.get("grid") or sweep.DEFAULT_GRID)
+    weights = request.get("weights") or sweep.DEFAULT_WEIGHTS
+    rows = asyncio.run(
+        sweep.run_sweep(clips, configs, weights, CLIPS_DIR / ".cache", on_progress)
+    )
+    return {
+        "rows": rows,
+        "unlabelled": unlabelled,
+        "clips": [clip["name"] for clip in clips],
+        "seconds": sum(len(clip["pcm"]) for clip in clips) / 2 / SAMPLE_RATE,
+    }
+
+
 class LabHandler(BaseHTTPRequestHandler):
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # The browser reloaded, closed the tab, or dropped one of the speculative
+            # connections it opens ahead of time. There is nobody left to answer, and
+            # the default handler prints a traceback that reads like a server fault.
+            pass
+
     def _send(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -401,11 +570,38 @@ class LabHandler(BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", LAB_HTML.read_bytes())
             return
+        if self.path == "/sweep":
+            self._send(200, "text/html; charset=utf-8", SWEEP_HTML.read_bytes())
+            return
+        if self.path == "/clips":
+            self._send(200, "application/json", json.dumps(list_clips()).encode())
+            return
+        if self.path.startswith("/clips/"):
+            self._clip_audio(self.path[len("/clips/") :])
+            return
         self._send(404, "text/plain; charset=utf-8", b"not found")
+
+    def _clip_audio(self, name: str) -> None:
+        from urllib.parse import unquote
+
+        try:
+            path = CLIPS_DIR / safe_clip_file(unquote(name))
+            body = path.read_bytes()
+        except (ValueError, OSError):
+            self._send(404, "text/plain; charset=utf-8", b"not found")
+            return
+        # The browser decodes it, so the exact container does not matter here.
+        self._send(200, "application/octet-stream", body)
 
     def do_POST(self) -> None:
         if self.path == "/render":
             self._render()
+            return
+        if self.path == "/clips":
+            self._json_command(save_clip)
+            return
+        if self.path == "/sweep":
+            self._sweep_stream()
             return
         if self.path != "/analyze":
             self._send(404, "text/plain; charset=utf-8", b"not found")
@@ -428,6 +624,43 @@ class LabHandler(BaseHTTPRequestHandler):
             return
 
         self._send(200, "application/json", json.dumps(payload).encode())
+
+    def _json_command(self, handler) -> None:
+        """Read a JSON body, hand it to `handler`, send back whatever it returns."""
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = handler(json.loads(self.rfile.read(length)))
+        except Exception as exc:
+            body = json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode()
+            self._send(400, "application/json", body)
+            return
+        self._send(200, "application/json", json.dumps(payload, default=str).encode())
+
+    def _sweep_stream(self) -> None:
+        """Stream the sweep as newline-delimited JSON: progress lines, then the result.
+
+        A sweep runs for minutes and this server is single threaded, so it cannot answer
+        a separate progress endpoint while it works. Streaming the one response instead
+        needs no threads and no shared state — the progress *is* the reply, arriving as
+        it happens. No Content-Length: the body ends when the connection closes.
+        """
+        length = int(self.headers.get("Content-Length", 0))
+        request = json.loads(self.rfile.read(length))
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+
+        def emit(payload: dict) -> None:
+            self.wfile.write((json.dumps(payload, default=str) + "\n").encode())
+            self.wfile.flush()
+
+        try:
+            # Headers are already out, so a failure here has to travel as a line of the
+            # body rather than as a status code.
+            emit({"result": run_sweep_request(request, emit)})
+        except Exception as exc:
+            emit({"error": f"{type(exc).__name__}: {exc}"})
 
     def _render(self) -> None:
         length = int(self.headers.get("Content-Length", 0))

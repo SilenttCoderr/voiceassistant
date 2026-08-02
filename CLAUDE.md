@@ -13,11 +13,6 @@ uv run pytest tests/test_vad.py -k firered -v
 uv run bot.py -t webrtc     # then open http://localhost:7860/client
 ```
 
-Prefix shell commands with `rtk` (token-saving proxy). Use `rtk proxy <cmd>` when you need
-byte-exact output — `rtk` and the headroom proxy both compress tool output lossily, which
-mangles source files read through `Read`/`Grep`. Reading `.py` files in <60-line chunks, or
-`rtk proxy sed -n 'A,Bp' file`, gives faithful text.
-
 Optional extras, install only when testing that path:
 `uv sync --extra ten|firered|cobra|rnnoise|koala`
 
@@ -33,6 +28,18 @@ Optional extras, install only when testing that path:
   no build step). Replays a recorded WAV through the real `create_vad()` while sweeping
   thresholds. Drives the analyzers directly, so it must call `set_sample_rate(16000)` on
   both the VAD and turn analyzer — the pipeline normally does that at transport start.
+- `sweep.html` — the label editor and sweep runner, served by `lab.py` at `/sweep`. Draw
+  regions on the waveform, save, pick a grid, run. The browser decodes the audio
+  (`decodeAudioData` handles m4a), so clips are stored as 16 kHz mono WAV and this path
+  never needs ffmpeg; `lab.decode_audio` shells out to ffmpeg only for the CLI.
+- `sweep.py` — the scored half of the lab. Grid-expands configs, replays labelled
+  `clips/*.wav` through `lab.analyze`, ranks them. Reuses `lab.py` for everything
+  audio; it only adds labels, metrics and a table. Denoise output is cached per
+  clip+chain because filtering, not VAD, dominates the runtime.
+- `speaker.py` — speaker gate. sherpa-onnx loads a plain ONNX embedding model, so the
+  "backend" is only which file you point at: CAM++ and TitaNet swap with no code
+  change. Lab-only for now — nothing in `bot.py` calls it until a sweep says it earns
+  its latency.
 - `tests/` — pure unit tests; every optional dependency is faked via `sys.modules`.
 - `docs/superpowers/{specs,plans}/` — dated design spec and task-by-task plans. Read the
   spec before changing architecture; it defines what is intentionally excluded.
@@ -70,7 +77,18 @@ which events actually exist — keep it that way rather than over-promising.
 Adding a backend: add to `SUPPORTED_BACKENDS`, add a branch in `create_vad`, add the extra
 to `pyproject.toml`, add faked-module tests, then document it in README and `.env.example`.
 
-## Known trap
+## Known traps
+
+Offline replay must not depend on wall clock. `lab._steady_resamplers()` suppresses
+Pipecat's timing-based resampler history clearing during replay, and
+`sweep.denoise()` caches denoised audio to `clips/.cache` because soxr at HQ+int16
+does not reproduce byte for byte and RNNoise amplifies the difference. Both are
+test-enforced; without them the same sweep ranks configs differently on each run.
+
+Editing `pyproject.toml` makes the next plain `uv run` re-sync the venv to the base
+dependencies, silently uninstalling every extra — TEN, FireRed, RNNoise all vanish and
+backends start raising "install it with `uv sync --extra ...`". After any dependency
+edit, re-run `uv sync` with the full extra list you actually use.
 
 `bot.py` calls `load_dotenv(override=False)` at import time, so importing `bot` in tests
 leaks the developer's real `.env` into `os.environ`. Tests that read a VAD env var must

@@ -14,6 +14,11 @@ ten = ["ten-vad @ git+https://github.com/TEN-framework/ten-vad.git@22a3bcd4509d0
 firered = ["fireredvad[cpu]==0.0.2", "pipecat-firered-vad==0.1.0"]
 rnnoise = ["pipecat-ai[rnnoise]>=1.4.0,<2"]
 koala = ["pipecat-ai[koala]>=1.4.0,<2"]
+# sherpa-onnx's native half ships as a separate package. uv's resolver misses it and
+# installs the binding alone, which then binds to whatever onnxruntime.dll it finds and
+# dies with an ORT API version mismatch. Both are pinned because the binding requires
+# an exact-version core.
+speaker = ["sherpa-onnx==1.13.4", "sherpa-onnx-core==1.13.4"]
 
 [dependency-groups]
 dev = ["pytest>=8,<9"]

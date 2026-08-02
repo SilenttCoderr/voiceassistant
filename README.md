@@ -230,6 +230,182 @@ inside Google's service; the lab rejects it. And Smart Turn's `max_duration_secs
 keys off wall-clock arrival times, so offline replay does not reproduce it for segments
 longer than that setting.
 
+## Sweep
+
+The lab compares a few slots on one clip by eye. `sweep.py` is the other half: it
+replays a folder of labelled clips through a whole parameter grid and scores every
+combination, so a setting gets chosen by a number rather than a hunch — and the same
+number can be recomputed after any later change to the chain.
+
+### The UI
+
+`uv run lab.py`, then open <http://localhost:7861/sweep>. This is the whole loop in one
+page: draw where the speech is, save, pick what to vary, run.
+
+- Drag across empty canvas to add a region, drag an edge to move it, drag the middle to
+  slide the whole thing. Click a region and press Delete to remove it. A click without a
+  drag seeks the player instead of leaving a sliver behind.
+- **save labels** writes `clips/<name>.wav` and `clips/<name>.json` together, so the pair
+  can never drift apart. The browser decodes and downmixes first, which means an m4a from
+  Voice Recorder can be dropped straight in and the server only ever stores 16 kHz mono
+  WAV — no ffmpeg involved on this path.
+- The sweep panel takes comma-separated numbers per axis and checkboxes for the rest. It
+  shows the config count as you type, because 4 backends × 5 confidences × 4 filters is
+  80 runs and worth noticing before you start one.
+- Results land in a sortable table: click any metric header to rank by it instead of by
+  the weighted score. Only settings that actually differ get a column.
+
+Filling in the speaker-gate enroll path adds `speaker_threshold: null` automatically, so
+the ungated baseline is always in the table next to the gated rows.
+
+The page waits for the whole grid — the server is single threaded, so a long sweep blocks
+it. That is fine for one person on localhost; watch the terminal if you want progress.
+
+Everything below also works from the command line, on the same files.
+
+A clip is a WAV plus a labels file of the same name:
+
+```
+clips/train-window-seat.wav
+clips/train-window-seat.json    {"speech": [[1.2, 3.4], [6.0, 7.1]]}
+```
+
+Region times are seconds into the clip. `"speech": []` marks a clip that must never
+trigger at all — pure background, or other people talking near the mic. Those negative
+clips are what make a false-trigger rate mean anything, so record a few.
+
+Any format ffmpeg can read works from the command line — `clips/train.m4a` is fine, it
+gets transcoded once per run. Without ffmpeg on PATH the error says so and names the
+install command. The UI never needs it, because the browser decodes first.
+
+```powershell
+uv run sweep.py label clips/train-window-seat.wav   # propose regions, then fix by ear
+uv run sweep.py run --top 15                        # rank the grid
+uv run sweep.py run --grid mygrid.json --sort false_per_min --json out.json
+```
+
+`label` is an energy gate keyed off the clip's own loudest frame. It gives a usable
+draft when speech is clearly above the background and a poor one when it is not —
+always check its output before trusting a score built on it.
+
+The grid file is `{"grid": {"backend": ["ten"], "confidence": [0.4, 0.6]}, "weights": {...}}`;
+the defaults live in `DEFAULT_GRID` and `DEFAULT_WEIGHTS` in `sweep.py`. Any key
+`lab.py` understands is sweepable, including `noise_filter` chains such as
+`highpass+rnnoise`. Keys that belong to another backend are dropped before the grid
+expands, so `ten_threshold` does not multiply the silero rows.
+
+Columns, all lower-is-better:
+
+- `miss%` — labelled speech the VAD never flagged. High means clipped words.
+- `fals/min` — separate speech onsets outside every labelled region, per minute of
+  non-speech. This is the number that predicts the agent interrupting itself.
+- `fals_s` — total seconds spent falsely in speech.
+- `onset` — median milliseconds from a region's start to the VAD noticing.
+- `tail` — median milliseconds the VAD holds the turn open after the words stop. This
+  is what `stop_secs` buys and what the user feels as reply latency.
+
+`score` is a weighted sum of the four, and the weights are a starting guess, not a
+finding. If the ranking disagrees with your ears, sort by the single column you care
+about instead of arguing with the weights.
+
+Denoising is the slow part and does not depend on the VAD settings, so each clip is
+filtered once per chain and every VAD variant replays the same filtered audio. A
+config that cannot load — missing extra, missing key — is reported under the table and
+the rest of the sweep still finishes.
+
+### Repeatability
+
+A score is worthless if the same command gives a different answer twice, and this
+took two fixes to get right.
+
+Pipecat's `SOXRStreamAudioResampler` clears its filter history whenever more than
+`clear_after_secs` of **wall clock** passes between chunks. That is correct for a
+live call and wrong for an offline replay: a GC pause or a model load between two
+chunks wiped the history mid-clip and rewrote the rest of the audio. `lab.py` now
+suppresses that during replay only — the live pipeline keeps it.
+
+Underneath that, soxr's stream resampler at `HQ`/`VHQ` with int16 rounds two
+different ways run to run. It is only ±2 LSB against a signal peak of ~25000, but
+RNNoise is a recurrent net and amplifies it until VAD decisions move a frame and
+close scores swap places. `QQ` and the float32 path are unaffected.
+
+So denoised audio is cached under `clips/.cache/` as plain WAVs, keyed by the audio
+and the filter settings. A clip is filtered once, ever, and every later sweep replays
+the same bytes — three consecutive sweeps now produce byte-identical JSON, and repeat
+runs are about 30% faster. The cache key does not cover the filter *code*, so delete
+the folder after changing `noise.py` or upgrading Pipecat. `--no-cache` re-denoises
+every time, and the scores will drift a little when you do.
+
+You can also just listen to a cached file to hear exactly what got scored.
+
+Scores are only as good as the labels. Three honest clips of the room that actually
+breaks the agent beat thirty guessed ones.
+
+## Speaker Gate
+
+VAD answers "is anyone talking". On a train that is the wrong question — the agent
+should wake for one person and ignore the man two seats away. A speaker embedding
+turns a stretch of speech into a vector and compares it against an enrolled
+recording, so strangers get dropped before the agent answers them.
+
+```powershell
+uv sync --extra speaker
+```
+
+Models are plain ONNX files from the [sherpa-onnx zoo](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models),
+downloaded into `pretrained_models/speaker/`. The backend is only which file you point
+at, so these swap without a code change:
+
+| File | Size | Trained on |
+| --- | --- | --- |
+| `3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx` | 27 MB | 200k speakers, code-switched Mandarin+English |
+| `nemo_en_titanet_large.onnx` | 97 MB | English (VoxCeleb etc.) |
+
+There is no Hinglish-trained speaker model — not on Hugging Face, not from AI4Bharat,
+not from NVIDIA. It matters less than it sounds: embeddings are text- and
+language-independent, they model how a voice sounds rather than what it says. Treat
+that as a claim to test on your own clips, not a guarantee.
+
+First pick a threshold. Enroll from one WAV or a directory of them, then score clips
+of yourself and clips of other people:
+
+```powershell
+uv run sweep.py similarity --enroll clips/enroll/ clips/me-1.wav clips/stranger-1.wav
+```
+
+On the sherpa-onnx sample speakers, CAM++ gives 0.854 for the enrolled speaker
+against 0.191 and 0.022 for two strangers; TitaNet gives 0.825 against 0.290 and
+0.169. Put the threshold in the gap. A narrow gap means the gate will cost you real
+turns.
+
+Then sweep it like any other parameter — `speaker_enroll` plus `speaker_threshold` in
+the grid turns the gate on, and `speaker_threshold: null` leaves it off for a
+baseline row:
+
+```json
+{"grid": {"speaker_enroll": ["clips/enroll"], "speaker_threshold": [null, 0.4, 0.5, 0.7]}}
+```
+
+On a 17 s clip of one enrolled speaker followed by a stranger, the gate is the whole
+difference between answering the stranger and not:
+
+```
+  score  miss% fals/min  fals_s   speaker_threshold
+   44.9   40.1     0.00     0.0                 0.4
+   44.9   40.1     0.00     0.0                 0.5
+  114.0   59.6     0.00     0.0                 0.7   <- now eating real speech
+  180.8   40.1    27.17     5.3                None   <- stranger wakes the agent
+```
+
+Two honest caveats. The gate judges each segment whole, which is a luxury the live
+pipeline will not have — it has to decide a few hundred milliseconds in — so read
+these numbers as the ceiling, not the forecast. And segments shorter than 400 ms are
+left alone, because an embedding from a fragment that short is closer to noise than
+to a voiceprint; they stay in the audio and stay counted against you.
+
+Nothing in `bot.py` calls any of this yet. Measure first, wire it into the pipeline
+once a sweep says it earns its latency.
+
 ## Turn Detection
 
 VAD decides whether someone is speaking. Turn detection decides whether *you have finished
